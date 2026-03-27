@@ -1,0 +1,81 @@
+[package]
+name = "oxiwhisper"
+version = "0.1.0"
+edition = "2024"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+description = "Pure Rust Whisper inference engine with minimal dependencies"
+repository = "https://github.com/cool-japan/oxiwhisper"
+homepage = "https://github.com/cool-japan/oxiwhisper"
+keywords = ["whisper", "speech-recognition", "asr", "inference", "audio"]
+categories = ["multimedia::audio", "science"]
+documentation = "https://docs.rs/oxiwhisper"
+
+[features]
+timing = []
+onnx = ["dep:oxionnx"]
+serde = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+half = "2.7"
+matrixmultiply = "0.3"
+oxifft = "0.1.3"
+oxionnx = { version = "0.1.0", optional = true }
+rand = "0.10"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+# Always compile with optimisations — inference is compute-heavy
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+[[example]]
+name = "check_shapes"
+path = "examples/check_shapes.rs"
+
+[[example]]
+name = "check_shapes2"
+path = "examples/check_shapes2.rs"
+
+[[example]]
+name = "bench2"
+path = "examples/bench2.rs"
+
+[[example]]
+name = "test_voice"
+path = "examples/test_voice.rs"
+
+[[example]]
+name = "profile_attention"
+path = "examples/profile_attention.rs"
+
+[[example]]
+name = "onnx_transcribe"
+path = "examples/onnx_transcribe.rs"
+required-features = ["onnx"]
+
+[[example]]
+name = "streaming"
+path = "examples/streaming.rs"
+
+[[example]]
+name = "batch_transcribe"
+path = "examples/batch_transcribe.rs"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "transcribe"
+harness = false
+
+[[example]]
+name = "transcribe"
+path = "examples/transcribe.rs"

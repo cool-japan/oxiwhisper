@@ -1,13 +1,40 @@
 //! Public types, error handling, and validation for oxiwhisper.
 
+/// Storage precision for the decoder KV (key-value) cache.
+///
+/// Reducing precision cuts memory usage at a small accuracy cost:
+/// - `F32`: full precision; no accuracy loss (default)
+/// - `VHalf`: V stored as f16, K as f32; ~25% memory savings, near-zero accuracy loss
+/// - `KvHalf`: K and V both stored as f16; ~50% memory savings, slight accuracy reduction
+///
+/// For Whisper tiny the KV cache is small (~850 KB total) — use `F32`.
+/// For medium/large models with beam search the savings matter more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KvCacheDtype {
+    /// Full f32 precision (default). No accuracy loss.
+    #[default]
+    F32,
+    /// V stored as f16, K as f32. ~25% memory savings, negligible accuracy impact.
+    VHalf,
+    /// K and V both stored as f16. ~50% memory savings, small accuracy reduction.
+    KvHalf,
+}
+
 /// Top-level error type for oxiwhisper.
 #[derive(Debug)]
 pub enum OxiWhisperError {
+    /// Low-level I/O error (file open, read, etc.).
     Io(std::io::Error),
+    /// Model file is missing a required tensor or has an unrecognised format.
     InvalidModel(String),
+    /// The encoder or decoder returned an error during inference.
     InferenceFailed(String),
+    /// A tensor shape mismatch was detected (programming error, not user error).
     ShapeMismatch(String),
+    /// An invalid combination of `TranscribeOptions` was supplied.
     ConfigError(String),
+    /// The audio data has an unsupported format or is corrupt.
     AudioFormatError(String),
 }
 
@@ -70,6 +97,12 @@ pub struct TranscribeOptions<'a> {
     /// cross-chunk coherence in long audio. The decoder prepends these before
     /// the SOT token to condition output on prior context.
     pub previous_tokens: Option<&'a [u32]>,
+    /// Storage precision for the decoder self-attention KV cache.
+    ///
+    /// The default `KvCacheDtype::F32` is lossless and keeps all existing
+    /// behaviour unchanged. Use `VHalf` or `KvHalf` to reduce peak memory
+    /// usage for large models or long sequences.
+    pub kv_cache_dtype: KvCacheDtype,
 }
 
 impl Default for TranscribeOptions<'static> {
@@ -86,6 +119,7 @@ impl Default for TranscribeOptions<'static> {
             no_repeat_ngram_size: 0,
             compression_ratio_threshold: 2.4,
             previous_tokens: None,
+            kv_cache_dtype: KvCacheDtype::F32,
         }
     }
 }

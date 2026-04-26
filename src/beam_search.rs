@@ -1,11 +1,10 @@
 //! Beam search decoder for Whisper.
 
 use crate::decode_utils::{
-    DecodeConstraints, apply_no_repeat_ngram, apply_suppress_tokens, argmax, is_stop_token,
-    log_softmax, normalized_score, top_k_log_probs,
+    DecodeArgs, apply_no_repeat_ngram, apply_suppress_tokens, argmax, is_stop_token, log_softmax,
+    normalized_score, top_k_log_probs,
 };
 use crate::decoder::{ForwardCtx, LayerKVCache, forward};
-use crate::tokenizer::SpecialTokens;
 
 use super::decoder::MAX_DECODE_LENGTH;
 
@@ -26,16 +25,19 @@ pub(crate) struct Beam {
 
 pub(crate) fn decode_beam(
     prompt: &[u32],
-    kv_capacity: usize,
     ctx: &ForwardCtx<'_>,
-    special: &SpecialTokens,
+    args: &DecodeArgs<'_>,
     beam_width: usize,
-    eot_threshold: u32,
-    constraints: &DecodeConstraints<'_>,
 ) -> Result<(Vec<u32>, Vec<f32>), String> {
+    let kv_capacity = args.kv_capacity;
+    let special = args.special;
+    let eot_threshold = args.eot_threshold;
+    let constraints = args.constraints;
+    let dtype = args.dtype;
+
     // Prefill with prompt.
     let mut initial_kv: Vec<LayerKVCache> = (0..ctx.n_layer)
-        .map(|_| LayerKVCache::new(ctx.n_head, ctx.head_dim, kv_capacity))
+        .map(|_| LayerKVCache::new_with_dtype(ctx.n_head, ctx.head_dim, kv_capacity, dtype))
         .collect();
     let mut initial_logits = forward(prompt, 0, &mut initial_kv, ctx, true)?;
     apply_suppress_tokens(&mut initial_logits, constraints.suppress);
@@ -145,7 +147,8 @@ pub(crate) fn decode_beam(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode_utils::normalized_score;
+    use crate::decode_utils::{DecodeConstraints, normalized_score};
+    use crate::types::KvCacheDtype;
 
     // ── Beam struct unit tests ──────────────────────────────────────────────
 
@@ -383,15 +386,16 @@ mod tests {
             suppress: &[],
             no_repeat_ngram_size: 0,
         };
+        let args = DecodeArgs {
+            kv_capacity,
+            special: &special,
+            eot_threshold,
+            constraints: &constraints,
+            dtype: KvCacheDtype::F32,
+        };
 
         let result = decode_beam(
-            &prompt,
-            kv_capacity,
-            &ctx,
-            &special,
-            3, // beam_width
-            eot_threshold,
-            &constraints,
+            &prompt, &ctx, &args, 3, // beam_width
         );
 
         assert!(

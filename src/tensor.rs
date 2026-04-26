@@ -2,11 +2,14 @@
 /// Supports 1D-4D tensors with f32 storage.
 #[derive(Clone, Debug)]
 pub struct Tensor {
+    /// Flat f32 element buffer in row-major (C-contiguous) order.
     pub data: Vec<f32>,
+    /// Dimension sizes, e.g. `[seq_len, n_state]` for a 2-D tensor.
     pub shape: Vec<usize>,
 }
 
 impl Tensor {
+    /// Create a zero-filled tensor with the given shape.
     pub fn zeros(shape: &[usize]) -> Self {
         let size: usize = shape.iter().product();
         Self {
@@ -15,6 +18,9 @@ impl Tensor {
         }
     }
 
+    /// Create a tensor from an existing data buffer and shape.
+    ///
+    /// Panics in debug builds if `data.len() != shape.iter().product()`.
     pub fn from_vec(data: Vec<f32>, shape: &[usize]) -> Self {
         debug_assert_eq!(
             data.len(),
@@ -29,6 +35,7 @@ impl Tensor {
         }
     }
 
+    /// Returns the total number of elements (product of all dimension sizes).
     pub fn numel(&self) -> usize {
         self.data.len()
     }
@@ -38,6 +45,7 @@ impl Tensor {
         self.shape[self.shape.len() - 1]
     }
 
+    /// Returns the number of dimensions (rank) of this tensor.
     pub fn ndim(&self) -> usize {
         self.shape.len()
     }

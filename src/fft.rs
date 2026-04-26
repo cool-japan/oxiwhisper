@@ -1,17 +1,22 @@
 //! FFT module backed by OxiFFT.
 //! Provides Complex type and FFT functions used throughout the codebase.
 
+/// A 32-bit floating-point complex number used by the FFT pipeline.
 #[derive(Clone, Copy, Debug)]
 pub struct Complex {
+    /// Real part of the complex number.
     pub re: f32,
+    /// Imaginary part of the complex number.
     pub im: f32,
 }
 
 impl Complex {
+    /// Construct a complex number from real and imaginary parts.
     pub fn new(re: f32, im: f32) -> Self {
         Self { re, im }
     }
 
+    /// Compute `re^2 + im^2` (squared magnitude, avoiding a sqrt).
     pub fn magnitude_squared(&self) -> f32 {
         self.re * self.re + self.im * self.im
     }

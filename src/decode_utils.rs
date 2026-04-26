@@ -10,6 +10,25 @@ pub(crate) struct DecodeConstraints<'a> {
     pub(crate) no_repeat_ngram_size: usize,
 }
 
+/// Shared arguments for greedy / beam / sample decoders.
+///
+/// Bundles the parameters that are identical across all three decoding
+/// strategies so each decode function signature stays under the clippy
+/// `too_many_arguments` limit.
+pub(crate) struct DecodeArgs<'a> {
+    /// Number of KV-cache slots to pre-allocate (prompt length + max decode steps + slack).
+    pub(crate) kv_capacity: usize,
+    /// Special token identifiers (EOT, no-speech, …).
+    pub(crate) special: &'a crate::tokenizer::SpecialTokens,
+    /// Highest token id that acts as a stop signal (= `special.eot` when
+    /// timestamps are disabled).
+    pub(crate) eot_threshold: u32,
+    /// Logit constraints (suppression list, n-gram blocking size).
+    pub(crate) constraints: &'a DecodeConstraints<'a>,
+    /// Numeric format for the self-attention KV cache.
+    pub(crate) dtype: crate::types::KvCacheDtype,
+}
+
 /// Argmax over a slice, returning the index of the largest element.
 pub(crate) fn argmax(logits: &[f32]) -> u32 {
     logits

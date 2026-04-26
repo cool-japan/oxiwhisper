@@ -2,35 +2,58 @@ use crate::linear;
 use crate::quantize::QuantizedTensor;
 use crate::tensor::Tensor;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Weights for a multi-head attention layer.
 pub struct AttentionWeights<'a> {
+    /// Query projection weight matrix `[n_state, n_state]`.
     pub q_weight: &'a Tensor,
+    /// Query projection bias `[n_state]`.
     pub q_bias: &'a Tensor,
+    /// Key projection weight matrix `[n_state, n_state]`.
     pub k_weight: &'a Tensor,
+    /// Value projection weight matrix `[n_state, n_state]`.
     pub v_weight: &'a Tensor,
+    /// Value projection bias `[n_state]`.
     pub v_bias: &'a Tensor,
+    /// Output projection weight matrix `[n_state, n_state]`.
     pub out_weight: &'a Tensor,
+    /// Output projection bias `[n_state]`.
     pub out_bias: &'a Tensor,
 }
 
 /// Weights for a multi-head attention layer, supporting both f32 and quantized weights.
 pub struct AttentionWeightsAuto<'a> {
+    /// Query projection weight as f32 (present when unquantized).
     pub q_weight_f32: Option<&'a Tensor>,
+    /// Query projection weight as a quantized tensor (present when quantized).
     pub q_weight_quant: Option<&'a QuantizedTensor>,
+    /// Query projection bias `[n_state]`.
     pub q_bias: &'a Tensor,
+    /// Key projection weight as f32 (present when unquantized).
     pub k_weight_f32: Option<&'a Tensor>,
+    /// Key projection weight as a quantized tensor (present when quantized).
     pub k_weight_quant: Option<&'a QuantizedTensor>,
+    /// Value projection weight as f32 (present when unquantized).
     pub v_weight_f32: Option<&'a Tensor>,
+    /// Value projection weight as a quantized tensor (present when quantized).
     pub v_weight_quant: Option<&'a QuantizedTensor>,
+    /// Value projection bias `[n_state]`.
     pub v_bias: &'a Tensor,
+    /// Output projection weight as f32 (present when unquantized).
     pub out_weight_f32: Option<&'a Tensor>,
+    /// Output projection weight as a quantized tensor (present when quantized).
     pub out_weight_quant: Option<&'a QuantizedTensor>,
+    /// Output projection bias `[n_state]`.
     pub out_bias: &'a Tensor,
 }
 
 /// Configuration for a multi-head attention layer.
 pub struct AttentionConfig {
+    /// Number of attention heads.
     pub n_head: usize,
+    /// Whether to apply a causal (lower-triangular) attention mask.
     pub mask: bool,
 }
 
@@ -77,83 +100,142 @@ pub fn multi_head_attention(
     // Attention scores: Q @ K^T * scale  (sgemm with stride trick avoids explicit transpose)
     // q: [n_head, q_len, head_dim]  row-major
     // k: [n_head, kv_len, head_dim] row-major — K^T achieved by swapping strides
-    let mut scores = Tensor::from_vec(
-        vec![0.0f32; n_head * q_len * kv_len],
-        &[n_head, q_len, kv_len],
-    );
+    // scores: [n_head, q_len, kv_len] — head-major, contiguous per head (→ chunks_mut works)
+    let mut scores_data = vec![0.0f32; n_head * q_len * kv_len];
+    let mut attn_out = vec![0.0f32; n_head * q_len * head_dim];
 
-    for h in 0..n_head {
-        let q_ptr = q.data[h * q_len * head_dim..].as_ptr();
-        let k_ptr = k.data[h * kv_len * head_dim..].as_ptr();
-        let scores_ptr = scores.data[h * q_len * kv_len..].as_mut_ptr();
-
-        // Q @ K^T: [q_len, head_dim] × [head_dim, kv_len] = [q_len, kv_len]
-        // K is [kv_len, head_dim] row-major, so K^T strides = (1, head_dim)
-        unsafe {
-            matrixmultiply::sgemm(
-                q_len,
-                head_dim,
-                kv_len,
-                scale,
-                q_ptr,
-                head_dim as isize,
-                1,
-                k_ptr,
-                1,
-                head_dim as isize,
-                0.0,
-                scores_ptr,
-                kv_len as isize,
-                1,
-            );
+    // QK^T: parallel over heads (scores and q/k slices are head-major, disjoint).
+    #[cfg(feature = "parallel")]
+    {
+        scores_data
+            .par_chunks_mut(q_len * kv_len)
+            .enumerate()
+            .for_each(|(h, s_chunk)| {
+                let q_ptr = q.data[h * q_len * head_dim..].as_ptr();
+                let k_ptr = k.data[h * kv_len * head_dim..].as_ptr();
+                unsafe {
+                    matrixmultiply::sgemm(
+                        q_len,
+                        head_dim,
+                        kv_len,
+                        scale,
+                        q_ptr,
+                        head_dim as isize,
+                        1,
+                        k_ptr,
+                        1,
+                        head_dim as isize,
+                        0.0,
+                        s_chunk.as_mut_ptr(),
+                        kv_len as isize,
+                        1,
+                    );
+                }
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for h in 0..n_head {
+            let q_ptr = q.data[h * q_len * head_dim..].as_ptr();
+            let k_ptr = k.data[h * kv_len * head_dim..].as_ptr();
+            let s_ptr = scores_data[h * q_len * kv_len..].as_mut_ptr();
+            // Q @ K^T: [q_len, head_dim] × [head_dim, kv_len] = [q_len, kv_len]
+            unsafe {
+                matrixmultiply::sgemm(
+                    q_len,
+                    head_dim,
+                    kv_len,
+                    scale,
+                    q_ptr,
+                    head_dim as isize,
+                    1,
+                    k_ptr,
+                    1,
+                    head_dim as isize,
+                    0.0,
+                    s_ptr,
+                    kv_len as isize,
+                    1,
+                );
+            }
         }
     }
 
-    // Apply causal mask if needed
+    // Apply causal mask if needed (serial — cheap scalar loop, branchy, hard to parallelize cleanly).
     if config.mask {
         for h in 0..n_head {
             let s_off = h * q_len * kv_len;
             for i in 0..q_len {
                 for j in (i + 1)..kv_len {
-                    scores.data[s_off + i * kv_len + j] = f32::NEG_INFINITY;
+                    scores_data[s_off + i * kv_len + j] = f32::NEG_INFINITY;
                 }
             }
         }
     }
 
-    // Softmax (in-place)
+    // Softmax (serial, in-place, row-wise).
+    let mut scores = Tensor::from_vec(scores_data, &[n_head, q_len, kv_len]);
     scores.softmax_inplace();
 
     // scores @ V: [n_head, q_len, kv_len] @ [n_head, kv_len, head_dim] -> [n_head, q_len, head_dim]
-    let mut attn_out = vec![0.0f32; n_head * q_len * head_dim];
-
-    for h in 0..n_head {
-        let scores_ptr = scores.data[h * q_len * kv_len..].as_ptr();
-        let v_ptr = v.data[h * kv_len * head_dim..].as_ptr();
-        let out_ptr = attn_out[h * q_len * head_dim..].as_mut_ptr();
-
-        // scores @ V: [q_len, kv_len] × [kv_len, head_dim] = [q_len, head_dim]
-        unsafe {
-            matrixmultiply::sgemm(
-                q_len,
-                kv_len,
-                head_dim,
-                1.0,
-                scores_ptr,
-                kv_len as isize,
-                1,
-                v_ptr,
-                head_dim as isize,
-                1,
-                0.0,
-                out_ptr,
-                head_dim as isize,
-                1,
-            );
+    // attn_out: head-major, contiguous per head.
+    #[cfg(feature = "parallel")]
+    {
+        attn_out
+            .par_chunks_mut(q_len * head_dim)
+            .enumerate()
+            .for_each(|(h, o_chunk)| {
+                let s_ptr = scores.data[h * q_len * kv_len..].as_ptr();
+                let v_ptr = v.data[h * kv_len * head_dim..].as_ptr();
+                unsafe {
+                    matrixmultiply::sgemm(
+                        q_len,
+                        kv_len,
+                        head_dim,
+                        1.0,
+                        s_ptr,
+                        kv_len as isize,
+                        1,
+                        v_ptr,
+                        head_dim as isize,
+                        1,
+                        0.0,
+                        o_chunk.as_mut_ptr(),
+                        head_dim as isize,
+                        1,
+                    );
+                }
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for h in 0..n_head {
+            let s_ptr = scores.data[h * q_len * kv_len..].as_ptr();
+            let v_ptr = v.data[h * kv_len * head_dim..].as_ptr();
+            let o_ptr = attn_out[h * q_len * head_dim..].as_mut_ptr();
+            // scores @ V: [q_len, kv_len] × [kv_len, head_dim] = [q_len, head_dim]
+            unsafe {
+                matrixmultiply::sgemm(
+                    q_len,
+                    kv_len,
+                    head_dim,
+                    1.0,
+                    s_ptr,
+                    kv_len as isize,
+                    1,
+                    v_ptr,
+                    head_dim as isize,
+                    1,
+                    0.0,
+                    o_ptr,
+                    head_dim as isize,
+                    1,
+                );
+            }
         }
     }
 
-    // Transpose back: [n_head, q_len, head_dim] -> [q_len, n_head, head_dim] -> [q_len, n_state]
+    // Transpose back: [n_head, q_len, head_dim] -> [q_len, n_state] (serial stitch).
     let mut concat = vec![0.0f32; q_len * n_state];
     for h in 0..n_head {
         for i in 0..q_len {
@@ -220,81 +302,140 @@ pub fn multi_head_attention_auto(
     let k = transpose_1_0(&k, n_head, kv_len, head_dim);
     let v = transpose_1_0(&v, n_head, kv_len, head_dim);
 
-    // Attention scores: Q @ K^T * scale  (sgemm with stride trick avoids explicit transpose)
-    let mut scores = Tensor::from_vec(
-        vec![0.0f32; n_head * q_len * kv_len],
-        &[n_head, q_len, kv_len],
-    );
+    // Attention scores: Q @ K^T * scale (sgemm, stride trick for K^T)
+    // scores: [n_head, q_len, kv_len] — head-major, contiguous per head.
+    let mut scores_data = vec![0.0f32; n_head * q_len * kv_len];
+    let mut attn_out = vec![0.0f32; n_head * q_len * head_dim];
 
-    for h in 0..n_head {
-        let q_ptr = q.data[h * q_len * head_dim..].as_ptr();
-        let k_ptr = k.data[h * kv_len * head_dim..].as_ptr();
-        let scores_ptr = scores.data[h * q_len * kv_len..].as_mut_ptr();
-
-        unsafe {
-            matrixmultiply::sgemm(
-                q_len,
-                head_dim,
-                kv_len,
-                scale,
-                q_ptr,
-                head_dim as isize,
-                1,
-                k_ptr,
-                1,
-                head_dim as isize,
-                0.0,
-                scores_ptr,
-                kv_len as isize,
-                1,
-            );
+    // QK^T: parallel over heads.
+    #[cfg(feature = "parallel")]
+    {
+        scores_data
+            .par_chunks_mut(q_len * kv_len)
+            .enumerate()
+            .for_each(|(h, s_chunk)| {
+                let q_ptr = q.data[h * q_len * head_dim..].as_ptr();
+                let k_ptr = k.data[h * kv_len * head_dim..].as_ptr();
+                unsafe {
+                    matrixmultiply::sgemm(
+                        q_len,
+                        head_dim,
+                        kv_len,
+                        scale,
+                        q_ptr,
+                        head_dim as isize,
+                        1,
+                        k_ptr,
+                        1,
+                        head_dim as isize,
+                        0.0,
+                        s_chunk.as_mut_ptr(),
+                        kv_len as isize,
+                        1,
+                    );
+                }
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for h in 0..n_head {
+            let q_ptr = q.data[h * q_len * head_dim..].as_ptr();
+            let k_ptr = k.data[h * kv_len * head_dim..].as_ptr();
+            let s_ptr = scores_data[h * q_len * kv_len..].as_mut_ptr();
+            unsafe {
+                matrixmultiply::sgemm(
+                    q_len,
+                    head_dim,
+                    kv_len,
+                    scale,
+                    q_ptr,
+                    head_dim as isize,
+                    1,
+                    k_ptr,
+                    1,
+                    head_dim as isize,
+                    0.0,
+                    s_ptr,
+                    kv_len as isize,
+                    1,
+                );
+            }
         }
     }
 
-    // Apply causal mask if needed
+    // Apply causal mask if needed (serial — cheap scalar, branchy).
     if config.mask {
         for h in 0..n_head {
             let s_off = h * q_len * kv_len;
             for i in 0..q_len {
                 for j in (i + 1)..kv_len {
-                    scores.data[s_off + i * kv_len + j] = f32::NEG_INFINITY;
+                    scores_data[s_off + i * kv_len + j] = f32::NEG_INFINITY;
                 }
             }
         }
     }
 
-    // Softmax (in-place)
+    // Softmax (serial, in-place, row-wise).
+    let mut scores = Tensor::from_vec(scores_data, &[n_head, q_len, kv_len]);
     scores.softmax_inplace();
 
     // scores @ V: [n_head, q_len, kv_len] @ [n_head, kv_len, head_dim] -> [n_head, q_len, head_dim]
-    let mut attn_out = vec![0.0f32; n_head * q_len * head_dim];
-
-    for h in 0..n_head {
-        let scores_ptr = scores.data[h * q_len * kv_len..].as_ptr();
-        let v_ptr = v.data[h * kv_len * head_dim..].as_ptr();
-        let out_ptr = attn_out[h * q_len * head_dim..].as_mut_ptr();
-
-        unsafe {
-            matrixmultiply::sgemm(
-                q_len,
-                kv_len,
-                head_dim,
-                1.0,
-                scores_ptr,
-                kv_len as isize,
-                1,
-                v_ptr,
-                head_dim as isize,
-                1,
-                0.0,
-                out_ptr,
-                head_dim as isize,
-                1,
-            );
+    #[cfg(feature = "parallel")]
+    {
+        attn_out
+            .par_chunks_mut(q_len * head_dim)
+            .enumerate()
+            .for_each(|(h, o_chunk)| {
+                let s_ptr = scores.data[h * q_len * kv_len..].as_ptr();
+                let v_ptr = v.data[h * kv_len * head_dim..].as_ptr();
+                unsafe {
+                    matrixmultiply::sgemm(
+                        q_len,
+                        kv_len,
+                        head_dim,
+                        1.0,
+                        s_ptr,
+                        kv_len as isize,
+                        1,
+                        v_ptr,
+                        head_dim as isize,
+                        1,
+                        0.0,
+                        o_chunk.as_mut_ptr(),
+                        head_dim as isize,
+                        1,
+                    );
+                }
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for h in 0..n_head {
+            let s_ptr = scores.data[h * q_len * kv_len..].as_ptr();
+            let v_ptr = v.data[h * kv_len * head_dim..].as_ptr();
+            let o_ptr = attn_out[h * q_len * head_dim..].as_mut_ptr();
+            unsafe {
+                matrixmultiply::sgemm(
+                    q_len,
+                    kv_len,
+                    head_dim,
+                    1.0,
+                    s_ptr,
+                    kv_len as isize,
+                    1,
+                    v_ptr,
+                    head_dim as isize,
+                    1,
+                    0.0,
+                    o_ptr,
+                    head_dim as isize,
+                    1,
+                );
+            }
         }
     }
 
-    // Transpose back
+    // Transpose back: [n_head, q_len, head_dim] -> [q_len, n_state] (serial stitch).
     let mut concat = vec![0.0f32; q_len * n_state];
     for h in 0..n_head {
         for i in 0..q_len {

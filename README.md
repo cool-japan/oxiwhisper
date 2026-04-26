@@ -2,23 +2,23 @@
 
 Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 
-> 12,596 LoC | 278 tests | 25 modules | 10 examples | Apache-2.0
+> 17,101 LoC | 399 tests | 24 modules | 10 examples | Apache-2.0
 
 ## Status
 
 | Component | Status | Tests |
 |-----------|--------|-------|
-| Core inference (encoder/decoder) | Stable | 278 passing |
+| Core inference (encoder/decoder) | Stable | 399 passing |
 | Quantized inference (Q4_0/Q5_0/Q8_0) | Stable | 40+ |
 | SIMD kernels (AVX2/NEON/WASM) | Stable | 15+ |
 | Streaming API | Stable | 8+ |
-| Word timestamps (DTW) | Alpha | 6 |
+| Word timestamps (monotonic peak) | Stable | 15+ |
 | ONNX model loading | Stable | 13 |
 
 ## Features
 
 ### Inference
-- GGML model loading (`ggml-tiny.bin`, `ggml-base.bin`, etc.)
+- GGML and GGUF model loading (`ggml-tiny.bin`, `ggml-tiny.gguf`, etc.). Both formats are supported; the loader auto-detects the format from the file magic bytes — just change the path, no code change needed.
 - Q4_0, Q5_0, and Q8_0 quantized inference with dequantize-on-the-fly GEMV
 - SIMD-accelerated dot products: AVX2+FMA (x86_64), NEON (aarch64), simd128 (WASM)
 - `matrixmultiply::sgemm` for attention QK^T and scores@V with stride-based transpose
@@ -43,10 +43,12 @@ Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 - Automatic resampling to 16 kHz mono
 - Voice Activity Detection with adaptive noise floor thresholding
 - VAD-aware chunking for long audio at silence boundaries
-- Word-level timestamps via DTW cross-attention alignment
+- Word-level timestamps via cross-attention alignment. `align_tokens_dp_dtw` is the canonical function — a Sakoe-Chiba-banded DP-DTW with traceback. `align_tokens_dtw` is an alias with default band width. `align_tokens_monotonic_peak` is the fast-path alternative (argmax-per-row, no DP).
 - Log-mel spectrogram computation using OxiFFT
 
 ### API
+- `from_file(path)` — load a GGML or GGUF model from a file path (format auto-detected)
+- `from_file_mmap(path)` — memory-mapped model loading; lower peak RSS for medium/large models
 - `transcribe()`, `transcribe_segmented()`, `transcribe_timed()`
 - `transcribe_long()`, `transcribe_long_segmented()`, `transcribe_long_with_vad()`
 - `transcribe_batch()` for multiple audio clips
@@ -55,6 +57,7 @@ Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 - `encoder_output()` for embedding extraction
 - `mel_spectrogram()` for audio analysis
 - `model_stats()` for memory/parameter statistics
+- `oxiwhisper::threading::set_thread_count(n)` — configure the rayon thread-pool size when the `parallel` feature is enabled
 - Optional `serde` feature for JSON serialization via `to_json()`
 
 ## Quick Start
@@ -173,11 +176,19 @@ let opts = TranscribeOptions {
 
 ## Feature Flags
 
-| Feature  | Description                                      | Default |
-|----------|--------------------------------------------------|---------|
-| `timing` | Print per-phase timing diagnostics to stderr     | off     |
-| `onnx`   | Enable ONNX model loading via `oxionnx`          | off     |
-| `serde`  | JSON serialization for `TranscribeResult`, etc.  | off     |
+| Feature      | Description                                                                                         | Default |
+|--------------|-----------------------------------------------------------------------------------------------------|---------|
+| `timing`     | Print per-phase timing diagnostics to stderr                                                        | off     |
+| `onnx`       | Enable ONNX model loading via `oxionnx`                                                             | off     |
+| `serde`      | JSON serialization for `TranscribeResult`, etc.                                                     | off     |
+| `parallel`   | Per-head parallelism in encoder/decoder attention via rayon. WASM-safe (not in default features). Use `oxiwhisper::threading::set_thread_count(n)` to configure the pool size. | off |
+| `audio-flac` | FLAC audio decoding via symphonia                                                                   | off     |
+| `audio-ogg`  | Ogg/Vorbis audio decoding via symphonia                                                             | off     |
+| `audio-mp3`  | MP3 audio decoding via symphonia                                                                    | off     |
+| `audio-aac`  | AAC/M4A audio decoding via symphonia                                                                | off     |
+| `audio-opus` | Opus audio decoding via opus-decoder + ogg                                                          | off     |
+| `audio-all`  | Enables all audio format decoders above                                                             | off     |
+| `test-utils` | Exposes internal test helpers. For integration testing only; not for normal use.                    | off     |
 
 ## Architecture
 
@@ -188,9 +199,9 @@ Audio (WAV/f32) ─→ Mel Spectrogram (OxiFFT) ─→ Encoder (Conv + Transform
 Text ←─ Tokenizer ←─ Decoder (Autoregressive + KV Cache + Beam Search)
 ```
 
-**25 modules**: types, tensor, fft, mel, mel_filters, model, quantize, linear,
+**24 modules**: types, tensor, fft, mel, mel_filters, model, quantize, linear,
 attention, encoder, decoder, beam_search, decode_utils, tokenizer, audio, vad,
-stream, subtitle, dtw, hallucination, onnx_loader, test_utils
+stream, subtitle, dtw, hallucination, onnx_loader, test_utils, threading, whisper_model
 
 ## Examples
 

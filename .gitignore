@@ -1,2 +1,37 @@
+# Rust build artifacts
 **/target/
-Cargo.lock
+**/*.rs.bk
+
+# Cargo files
+**/Cargo.lock
+
+# claude
+.claude/
+**/CLAUDE.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Debug
+*.log
+
+# Fuzzing
+fuzz/corpus/
+fuzz/artifacts/
+
+# Rustc ICE dumps
+rustc-ice-*.txt
+
+# LLM
+**/.claude/

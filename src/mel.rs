@@ -1,10 +1,15 @@
 use std::f32::consts::PI;
 use std::sync::OnceLock;
 
+/// Audio sample rate assumed by Whisper (16 kHz).
 pub const WHISPER_SAMPLE_RATE: usize = 16000;
+/// FFT window size used for the mel spectrogram (400 samples = 25 ms at 16 kHz).
 pub const WHISPER_N_FFT: usize = 400;
+/// Hop length between successive STFT frames (160 samples = 10 ms at 16 kHz).
 pub const WHISPER_HOP_LENGTH: usize = 160;
+/// Number of mel filterbank channels in the Whisper mel spectrogram.
 pub const WHISPER_N_MELS: usize = 80;
+/// Maximum audio chunk length processed by Whisper in one pass (30 seconds).
 pub const WHISPER_CHUNK_LENGTH: usize = 30; // seconds
 
 /// Pre-computed Hann window of length WHISPER_N_FFT (400).
@@ -94,15 +99,20 @@ pub fn log_mel_spectrogram(audio: &[f32], mel_filters: &[f32]) -> Vec<f32> {
     mel_spec
 }
 
+/// Returns the number of mel filterbank channels (`WHISPER_N_MELS = 80`).
 pub fn n_mels() -> usize {
     WHISPER_N_MELS
 }
 
+/// Compute the number of mel spectrogram frames for a given number of audio samples.
+///
+/// The result is clamped to at most 3000 frames (= 30 s at 10 ms hop length).
 pub fn n_frames_for_samples(n_samples: usize) -> usize {
     (n_samples.div_ceil(WHISPER_HOP_LENGTH) + 1)
         .min(WHISPER_SAMPLE_RATE * WHISPER_CHUNK_LENGTH / WHISPER_HOP_LENGTH)
 }
 
+/// Returns the audio context length in encoder frames (1500 = 30 s at 20 ms stride).
 pub fn n_audio_ctx() -> usize {
     1500
 }

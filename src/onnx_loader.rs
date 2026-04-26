@@ -726,12 +726,73 @@ fn parse_json_string(bytes: &[u8], pos: usize) -> Result<(String, usize), String
                             .map_err(|_| "Invalid \\u escape".to_string())?;
                         let code_point = u32::from_str_radix(hex_str, 16)
                             .map_err(|_| format!("Invalid \\u escape: {hex_str}"))?;
-                        if let Some(ch) = char::from_u32(code_point) {
-                            let mut buf = [0u8; 4];
-                            let encoded = ch.encode_utf8(&mut buf);
-                            result.extend_from_slice(encoded.as_bytes());
+
+                        match code_point {
+                            0xD800..=0xDBFF => {
+                                // High surrogate: must be followed by \uXXXX low surrogate.
+                                // Positions: i points at 'u', so:
+                                //   i+1..=i+4 = high hex digits (already parsed)
+                                //   i+5 = '\'
+                                //   i+6 = 'u'
+                                //   i+7..=i+10 = low hex digits
+                                let has_backslash = bytes.get(i + 5) == Some(&b'\\');
+                                let has_u = bytes.get(i + 6) == Some(&b'u');
+                                let low_hex = bytes.get(i + 7..=i + 10);
+                                if !has_backslash || !has_u {
+                                    return Err(format!(
+                                        "High surrogate U+{code_point:04X} not followed by low surrogate"
+                                    ));
+                                }
+                                let low_bytes = low_hex.ok_or_else(|| {
+                                    format!(
+                                        "High surrogate U+{code_point:04X} not followed by low surrogate"
+                                    )
+                                })?;
+                                let low_hex_str = std::str::from_utf8(low_bytes)
+                                    .map_err(|_| {
+                                        format!(
+                                            "High surrogate U+{code_point:04X} not followed by low surrogate"
+                                        )
+                                    })?;
+                                let low = u32::from_str_radix(low_hex_str, 16).map_err(|_| {
+                                    format!(
+                                        "High surrogate U+{code_point:04X} not followed by low surrogate"
+                                    )
+                                })?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(format!(
+                                        "High surrogate U+{code_point:04X} not followed by low surrogate"
+                                    ));
+                                }
+                                // Combine into supplementary code point.
+                                let cp =
+                                    0x10000u32 + (code_point - 0xD800) * 0x400 + (low - 0xDC00);
+                                let ch = char::from_u32(cp).ok_or_else(|| {
+                                    format!("Invalid supplementary scalar U+{cp:05X}")
+                                })?;
+                                let mut buf = [0u8; 4];
+                                let encoded = ch.encode_utf8(&mut buf);
+                                result.extend_from_slice(encoded.as_bytes());
+                                // Advance past: 4 high hex + '\' + 'u' + 4 low hex = 10 extra
+                                // The outer loop adds +1, giving 11 total from 'u'.
+                                i += 10;
+                            }
+                            0xDC00..=0xDFFF => {
+                                return Err(format!(
+                                    "Unexpected lone low surrogate U+{code_point:04X}"
+                                ));
+                            }
+                            _ => {
+                                // Ordinary BMP code point.
+                                let ch = char::from_u32(code_point).ok_or_else(|| {
+                                    format!("Invalid Unicode scalar U+{code_point:04X}")
+                                })?;
+                                let mut buf = [0u8; 4];
+                                let encoded = ch.encode_utf8(&mut buf);
+                                result.extend_from_slice(encoded.as_bytes());
+                                i += 4;
+                            }
                         }
-                        i += 4;
                     }
                     other => {
                         result.push(b'\\');
@@ -1158,5 +1219,110 @@ mod tests {
             Some(("12", "fc1.weight"))
         );
         assert_eq!(split_layer_suffix("abc.fc1.weight"), None);
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_handles_unicode_escapes() {
+        // \uXXXX escape sequences in vocab text should be decoded properly.
+        // parse_json_string does handle \uXXXX via char::from_u32 + encode_utf8.
+        // The JSON key "café" (café) should decode to the UTF-8 string "café".
+        let json = r#"{"model": {"vocab": {"café": 0, "naïve": 1}}}"#;
+        let vocab = parse_tokenizer_json(json, 3).expect("parse failed");
+        assert!(vocab.len() >= 2, "vocab should have at least 2 entries");
+        assert_eq!(vocab[0].text, "café", "\\u00e9 must decode to é");
+        assert_eq!(vocab[1].text, "naïve", "\\u00ef must decode to ï");
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_rejects_unpaired_surrogate() {
+        // Lone high surrogate \uD800 is not a valid Unicode scalar value.
+        // After BUG1 fix: parse_json_string must return Err for lone surrogates.
+        let json = r#"{"model": {"vocab": {"\uD800bad": 0, "ok": 1}}}"#;
+        let result = parse_tokenizer_json(json, 3);
+        assert!(result.is_err(), "lone high surrogate must be rejected");
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_handles_supplementary_plane() {
+        // Literal UTF-8 supplementary characters in JSON keys pass through correctly.
+        let bytes_smiley = "\"😀\"".as_bytes();
+        let (s, _) = parse_json_string(bytes_smiley, 0).expect("literal 😀 should parse");
+        assert_eq!(s, "😀");
+
+        let bytes_math = "\"𝐀\"".as_bytes();
+        let (s, _) = parse_json_string(bytes_math, 0).expect("literal 𝐀 should parse");
+        assert_eq!(s, "𝐀");
+
+        let bytes_cjk = "\"𠀀\"".as_bytes();
+        let (s, _) = parse_json_string(bytes_cjk, 0).expect("literal 𠀀 should parse");
+        assert_eq!(s, "𠀀");
+
+        // Surrogate-pair \u escape form: 😀 → 😀 (U+1F600)
+        // We must build the raw bytes explicitly because br#"..."# would just be UTF-8.
+        let bytes_escape = b"\"\\uD83D\\uDE00\"";
+        let (s, _) =
+            parse_json_string(bytes_escape, 0).expect("surrogate pair \\uD83D\\uDE00 should parse");
+        assert_eq!(s, "😀", "\\uD83D\\uDE00 must decode to 😀");
+
+        // Surrogate pair: 𝄞 → 𝄞 (U+1D11E, MUSICAL SYMBOL G CLEF)
+        let bytes_music = b"\"\\uD834\\uDD1E\"";
+        let (s, _) =
+            parse_json_string(bytes_music, 0).expect("surrogate pair \\uD834\\uDD1E should parse");
+        assert_eq!(s, "\u{1D11E}", "\\uD834\\uDD1E must decode to U+1D11E");
+
+        // Surrogate pair: 𠀀 → 𠀀 (U+20000, CJK Extension B)
+        let bytes_cjk_escape = b"\"\\uD840\\uDC00\"";
+        let (s, _) = parse_json_string(bytes_cjk_escape, 0)
+            .expect("surrogate pair \\uD840\\uDC00 should parse");
+        assert_eq!(s, "\u{20000}", "\\uD840\\uDC00 must decode to U+20000");
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_rejects_lone_high_surrogate() {
+        // A bare \uD800 (without a following low surrogate) must be rejected.
+        let bytes = br#""\uD800bad""#;
+        let result = parse_json_string(bytes, 0);
+        assert!(
+            result.is_err(),
+            "lone high surrogate \\uD800 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_rejects_lone_low_surrogate() {
+        // A lone low surrogate \uDC00 must be rejected.
+        let bytes = br#""\uDC00""#;
+        let result = parse_json_string(bytes, 0);
+        assert!(
+            result.is_err(),
+            "lone low surrogate \\uDC00 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_rejects_high_surrogate_followed_by_non_low() {
+        // High surrogate followed by 'A' instead of \uXXXX — must be rejected.
+        let bytes = br#""\uD83DA""#;
+        let result = parse_json_string(bytes, 0);
+        assert!(
+            result.is_err(),
+            "high surrogate followed by 'A' must be rejected"
+        );
+
+        // High surrogate followed by arbitrary text (no second \u) — must be rejected.
+        let bytes2 = br#""\uD83Dabc""#;
+        let result2 = parse_json_string(bytes2, 0);
+        assert!(
+            result2.is_err(),
+            "high surrogate not followed by \\u must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_tokenizer_json_rejects_truncated_after_high_surrogate() {
+        // High surrogate with nothing following it (string ends) — must be rejected.
+        let bytes = br#""\uD83D""#;
+        let result = parse_json_string(bytes, 0);
+        assert!(result.is_err(), "truncated high surrogate must be rejected");
     }
 }

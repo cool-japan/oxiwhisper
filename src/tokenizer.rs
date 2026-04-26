@@ -1,3 +1,18 @@
+//! Pure vocab pass-through decoding for Whisper's BPE token vocabulary.
+//!
+//! This module performs **pure vocab pass-through decoding** — there is no
+//! `encode()` function and no merge table. Whisper's GPT-2 byte-level decoding
+//! is performed once at GGML load time (see `model::ModelData::load`), so by
+//! the time `decode` runs, every `VocabEntry::text` is already valid UTF-8.
+//! oxiwhisper is inference-only.
+//!
+//! # Elision rules
+//! - **Special tokens** whose `text` begins with `"<|"` are silently dropped.
+//! - **Out-of-range token IDs** (`id >= vocab.len()`) are silently dropped.
+//!
+//! Neither elision produces an error — this is intentional for robustness
+//! against malformed decoder output.
+
 use crate::model::VocabEntry;
 
 /// First timestamp token ID in Whisper vocabulary.
@@ -8,16 +23,27 @@ pub const TIMESTAMP_RESOLUTION: f32 = 0.02;
 
 /// Special token IDs for Whisper
 pub struct SpecialTokens {
-    pub sot: u32,           // <|startoftranscript|>
-    pub eot: u32,           // <|endoftext|>
-    pub transcribe: u32,    // <|transcribe|>
-    pub translate: u32,     // <|translate|>
-    pub no_timestamps: u32, // <|notimestamps|>
-    pub no_speech: u32,     // <|nospeech|>
-    pub sot_prev: u32,      // <|startofprev|>
+    /// `<|startoftranscript|>` — begins the decoder sequence.
+    pub sot: u32,
+    /// `<|endoftext|>` — signals the end of the decoder output.
+    pub eot: u32,
+    /// `<|transcribe|>` — task token selecting transcription mode.
+    pub transcribe: u32,
+    /// `<|translate|>` — task token selecting translation mode.
+    pub translate: u32,
+    /// `<|notimestamps|>` — suppresses timestamp tokens in the output.
+    pub no_timestamps: u32,
+    /// `<|nospeech|>` — emitted when no speech is detected in the audio.
+    pub no_speech: u32,
+    /// `<|startofprev|>` — precedes previous-segment context tokens.
+    pub sot_prev: u32,
 }
 
 impl SpecialTokens {
+    /// Initialise special token IDs for a Whisper multilingual vocabulary.
+    ///
+    /// The `n_vocab` argument is accepted for forward compatibility but not
+    /// currently used — the token IDs are fixed for all Whisper models.
     pub fn new(_n_vocab: usize) -> Self {
         // Whisper special tokens are at the end of the vocabulary
         // For multilingual models:
@@ -173,6 +199,88 @@ pub fn parse_segments(token_ids: &[u32], vocab: &[VocabEntry]) -> Vec<(f32, f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_entry(text: &str) -> VocabEntry {
+        VocabEntry {
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_decode_cjk_passthrough() {
+        // CJK text should pass through byte-exact
+        let vocab = vec![
+            make_entry("日本語"),
+            make_entry("テスト"),
+            make_entry("한국어"),
+            make_entry("中文"),
+        ];
+        let result = decode(&[0, 1, 2, 3], &vocab);
+        assert_eq!(result, "日本語テスト한국어中文");
+        assert_eq!(result.len(), 33, "UTF-8 byte count");
+    }
+
+    #[test]
+    fn test_decode_emoji_with_zwj_sequences() {
+        // ZWJ joiners must be preserved byte-exact
+        let family = "👨\u{200D}👩\u{200D}👧"; // family emoji via ZWJ
+        let vocab = vec![make_entry(family)];
+        let result = decode(&[0], &vocab);
+        assert_eq!(result, family);
+    }
+
+    #[test]
+    fn test_decode_zero_width_characters() {
+        // BOM (U+FEFF) must be preserved, not stripped
+        let with_bom = "\u{FEFF}Hello";
+        let vocab = vec![make_entry(with_bom)];
+        let result = decode(&[0], &vocab);
+        assert!(result.starts_with('\u{FEFF}'), "BOM must be preserved");
+    }
+
+    #[test]
+    fn test_decode_whisper_prefix_space_handling() {
+        // Whisper sentencepiece-style leading spaces are preserved
+        let vocab = vec![make_entry(" Hello"), make_entry(" world")];
+        let result = decode(&[0, 1], &vocab);
+        assert_eq!(result, " Hello world");
+    }
+
+    #[test]
+    fn test_decode_special_tokens_round_trip() {
+        // Special tokens beginning with "<|" are elided; regular tokens pass through
+        let vocab = vec![
+            make_entry("<|startoftranscript|>"),
+            make_entry("<|en|>"),
+            make_entry("<|transcribe|>"),
+            make_entry("<|notimestamps|>"),
+            make_entry("Hello"),
+        ];
+        let result = decode(&[0, 1, 2, 3, 4], &vocab);
+        assert_eq!(result, "Hello", "all special tokens must be elided");
+    }
+
+    #[test]
+    fn test_decode_out_of_vocab_id_no_panic() {
+        // Out-of-range IDs must be silently dropped, not panic
+        let vocab = vec![make_entry("a"), make_entry("b"), make_entry("c")];
+        let result = decode(&[0, 99999, 1, u32::MAX, 2], &vocab);
+        assert_eq!(result, "abc", "only valid IDs should appear");
+    }
+
+    #[test]
+    fn test_decode_mixed_ascii_cjk_emoji_punctuation() {
+        // Combined stress test
+        let vocab = vec![
+            make_entry(" Hello"),
+            make_entry(" 世界"),
+            make_entry("!"),
+            make_entry(" 🎉"),
+            make_entry(" test."),
+        ];
+        let result = decode(&[0, 1, 2, 3, 4], &vocab);
+        assert_eq!(result, " Hello 世界! 🎉 test.");
+    }
 
     #[test]
     fn test_decode_space() {

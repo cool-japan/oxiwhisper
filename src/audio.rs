@@ -241,7 +241,7 @@ fn decode_samples(
 }
 
 /// Downmix interleaved multi-channel samples to mono by averaging channels.
-fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+pub(crate) fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();
     }
@@ -262,7 +262,7 @@ fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
 
 /// Resample mono audio from `source_rate` to `TARGET_SAMPLE_RATE` using
 /// linear interpolation.
-fn resample_linear(samples: &[f32], source_rate: u32) -> Vec<f32> {
+pub(crate) fn resample_linear(samples: &[f32], source_rate: u32) -> Vec<f32> {
     if source_rate == TARGET_SAMPLE_RATE || samples.is_empty() {
         return samples.to_vec();
     }
@@ -369,6 +369,269 @@ pub fn load_wav_from_bytes(data: &[u8]) -> Result<Vec<f32>, OxiWhisperError> {
 pub fn load_raw_pcm(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<f32> {
     let mono = downmix_to_mono(samples, channels);
     resample_linear(&mono, sample_rate)
+}
+
+/// Auto-detect audio format by magic bytes and decode to 16 kHz mono f32 PCM.
+///
+/// Supported formats depend on enabled feature flags:
+/// - WAV: always supported
+/// - FLAC: requires `audio-flac` feature
+/// - OGG Vorbis: requires `audio-ogg` feature
+/// - MP3: requires `audio-mp3` feature
+/// - AAC/M4A: requires `audio-aac` feature
+/// - Ogg Opus: requires `audio-opus` feature
+pub fn load_audio(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
+    use std::io::Read;
+
+    let mut magic = [0u8; 16];
+    let n = {
+        let mut f = std::fs::File::open(path).map_err(OxiWhisperError::Io)?;
+        f.read(&mut magic).map_err(OxiWhisperError::Io)?
+    };
+    if n < 4 {
+        return Err(OxiWhisperError::AudioFormatError(
+            "file too short to determine format".to_string(),
+        ));
+    }
+
+    // WAV: RIFF....WAVE
+    if magic.starts_with(b"RIFF") {
+        return load_wav(path);
+    }
+
+    // FLAC: fLaC
+    #[cfg(feature = "audio-flac")]
+    if magic.starts_with(b"fLaC") {
+        return load_flac(path);
+    }
+
+    // OGG container: OggS — check if it's Opus or Vorbis
+    if magic.starts_with(b"OggS") {
+        let bytes = std::fs::read(path).map_err(OxiWhisperError::Io)?;
+        let scan_end = bytes.len().min(100);
+
+        if bytes[..scan_end].windows(8).any(|w| w == b"OpusHead") {
+            #[cfg(feature = "audio-opus")]
+            return load_ogg_opus(&bytes);
+            #[cfg(not(feature = "audio-opus"))]
+            return Err(OxiWhisperError::AudioFormatError(
+                "Ogg Opus detected but `audio-opus` feature not enabled".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "audio-ogg")]
+        return load_ogg_vorbis(path);
+        #[cfg(not(feature = "audio-ogg"))]
+        return Err(OxiWhisperError::AudioFormatError(
+            "OGG Vorbis detected but `audio-ogg` feature not enabled".to_string(),
+        ));
+    }
+
+    // MP3: ID3 tag or sync frame 0xFF 0xFB / 0xFF 0xFA / 0xFF 0xF3
+    if magic.starts_with(b"ID3") || (magic[0] == 0xFF && (magic[1] & 0xE0 == 0xE0)) {
+        #[cfg(feature = "audio-mp3")]
+        return load_mp3(path);
+        #[cfg(not(feature = "audio-mp3"))]
+        return Err(OxiWhisperError::AudioFormatError(
+            "MP3 detected but `audio-mp3` feature not enabled".to_string(),
+        ));
+    }
+
+    // AAC/M4A: ftyp box at bytes 4..8
+    if n >= 8 && &magic[4..8] == b"ftyp" {
+        #[cfg(feature = "audio-aac")]
+        return load_aac(path);
+        #[cfg(not(feature = "audio-aac"))]
+        return Err(OxiWhisperError::AudioFormatError(
+            "AAC/M4A detected but `audio-aac` feature not enabled".to_string(),
+        ));
+    }
+
+    Err(OxiWhisperError::AudioFormatError(format!(
+        "unrecognized audio format (magic: {:02x?})",
+        &magic[..4]
+    )))
+}
+
+// ===========================================================================
+// Symphonia backend (FLAC, OGG Vorbis, MP3, AAC)
+// ===========================================================================
+
+#[cfg(any(
+    feature = "audio-flac",
+    feature = "audio-ogg",
+    feature = "audio-mp3",
+    feature = "audio-aac"
+))]
+fn decode_with_symphonia(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let src = std::fs::File::open(path).map_err(OxiWhisperError::Io)?;
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let hint = Hint::new();
+    let fmt_opts = FormatOptions::default();
+    let meta_opts = MetadataOptions::default();
+    let dec_opts = DecoderOptions::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &fmt_opts, &meta_opts)
+        .map_err(|e| OxiWhisperError::AudioFormatError(format!("symphonia probe: {e}")))?;
+
+    let mut format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| OxiWhisperError::AudioFormatError("no audio track found".to_string()))?;
+
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+
+    let sample_rate = codec_params
+        .sample_rate
+        .ok_or_else(|| OxiWhisperError::AudioFormatError("unknown sample rate".to_string()))?;
+    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(1);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &dec_opts)
+        .map_err(|e| OxiWhisperError::AudioFormatError(format!("symphonia decoder: {e}")))?;
+
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => continue,
+            Err(e) => {
+                return Err(OxiWhisperError::AudioFormatError(format!(
+                    "symphonia packet: {e}"
+                )));
+            }
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => {
+                return Err(OxiWhisperError::AudioFormatError(format!(
+                    "symphonia decode: {e}"
+                )));
+            }
+        };
+
+        let spec = *decoded.spec();
+        let capacity = decoded.capacity() as u64;
+
+        if sample_buf.is_none() {
+            sample_buf = Some(SampleBuffer::<f32>::new(capacity, spec));
+        }
+
+        if let Some(buf) = &mut sample_buf {
+            buf.copy_interleaved_ref(decoded);
+            all_samples.extend_from_slice(buf.samples());
+        }
+    }
+
+    let mono = downmix_to_mono(&all_samples, channels as u16);
+    let resampled = resample_linear(&mono, sample_rate);
+    Ok(resampled)
+}
+
+#[cfg(feature = "audio-flac")]
+fn load_flac(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
+    decode_with_symphonia(path)
+}
+
+#[cfg(feature = "audio-ogg")]
+fn load_ogg_vorbis(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
+    decode_with_symphonia(path)
+}
+
+#[cfg(feature = "audio-mp3")]
+fn load_mp3(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
+    decode_with_symphonia(path)
+}
+
+#[cfg(feature = "audio-aac")]
+fn load_aac(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
+    decode_with_symphonia(path)
+}
+
+// ===========================================================================
+// Ogg Opus backend
+// ===========================================================================
+
+#[cfg(feature = "audio-opus")]
+fn load_ogg_opus(bytes: &[u8]) -> Result<Vec<f32>, OxiWhisperError> {
+    use std::io::Cursor;
+
+    let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
+
+    // First packet: OpusHead
+    let head_packet = reader
+        .read_packet_expected()
+        .map_err(|e| OxiWhisperError::AudioFormatError(format!("ogg read: {e}")))?;
+
+    if !head_packet.data.starts_with(b"OpusHead") {
+        return Err(OxiWhisperError::AudioFormatError(
+            "not an Ogg Opus file".to_string(),
+        ));
+    }
+
+    // RFC 7845 §5.1: byte 9 = channel count
+    let channels = if head_packet.data.len() > 9 {
+        head_packet.data[9] as usize
+    } else {
+        1
+    };
+
+    if channels == 0 || channels > 2 {
+        return Err(OxiWhisperError::AudioFormatError(format!(
+            "unsupported Opus channel count: {channels} (only 1-2 supported)"
+        )));
+    }
+
+    // Skip OpusTags packet
+    let _ = reader
+        .read_packet_expected()
+        .map_err(|e| OxiWhisperError::AudioFormatError(format!("ogg tags: {e}")))?;
+
+    let mut decoder = opus_decoder::OpusDecoder::new(48000, channels)
+        .map_err(|e| OxiWhisperError::AudioFormatError(format!("opus decoder init: {e}")))?;
+
+    let max_frame_samples = opus_decoder::OpusDecoder::MAX_FRAME_SIZE_48K;
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut pcm_buf = vec![0.0f32; max_frame_samples * channels];
+
+    while let Ok(Some(packet)) = reader.read_packet() {
+        let n_samples = decoder
+            .decode_float(&packet.data, &mut pcm_buf, false)
+            .map_err(|e| OxiWhisperError::AudioFormatError(format!("opus decode: {e}")))?;
+        all_samples.extend_from_slice(&pcm_buf[..n_samples * channels]);
+    }
+
+    // Opus always outputs at 48 kHz; downmix then resample to 16 kHz
+    let mono = downmix_to_mono(&all_samples, channels as u16);
+    let resampled = resample_linear(&mono, 48000);
+    Ok(resampled)
 }
 
 // ===========================================================================

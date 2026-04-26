@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-04-26
+
+### Added
+- **GGUF format support**: `WhisperModel::from_file()` and `from_file_mmap()` auto-detect magic bytes and transparently accept both legacy GGML (`ggml-*.bin`) and modern GGUF (`*.gguf`) model files; no API change required (`src/model.rs`)
+- **`parallel` feature** (optional, not in defaults): per-head parallelism in decoder SDPA loops and encoder attention via rayon; enable with `features = ["parallel"]`; `threading::set_thread_count(n)` helper configures the rayon global pool; disabled by default to keep WASM and single-threaded builds unaffected (`src/threading.rs`, `src/decoder/sdpa.rs`, `src/encoder.rs`)
+- `WhisperModel::from_file_mmap()` — memory-mapped GGML model loading via `memmap2`; lower peak RSS for large models (`src/model.rs`, `src/lib.rs`)
+- `align_tokens_monotonic_peak()` — renamed from `align_tokens_dtw()`; deprecated shim preserves SemVer for 0.1.x callers (`src/dtw.rs`)
+- `load_audio()` — magic-byte auto-detecting audio loader; FLAC/OGG/MP3/AAC/Opus support via `audio-flac`/`audio-ogg`/`audio-mp3`/`audio-aac`/`audio-opus` features (`src/audio.rs`)
+- `KvCacheDtype { F32, VHalf, KvHalf }` — optional f16 KV-cache storage for ~25–50% memory savings (`src/decoder.rs`, `src/types.rs`)
+- Integration tests directory `tests/` with 5 binaries exercising full public API; new `test-utils` feature gates the synthetic model generator
+- `quantize.rs` refactored into `src/quantize/` directory (7 modules, each <500 lines); all public API preserved
+
+### Changed
+- `align_tokens_dtw` is no longer deprecated; it now implements true Sakoe-Chiba-banded dynamic programming DTW with traceback, replacing the previous monotonic-peak approximation; timestamps produced are smoother and more accurate for noisy attention matrices (semantic change, `src/dtw.rs`)
+- Word-timestamp feature graduated from Alpha to Stable; algorithm correctly documented as monotonic-peak alignment (not DP-DTW)
+- Decoder SDPA hot-path migrated from scalar triple-loops to `matrixmultiply::sgemm`; encoder attention scratch allocations hoisted out of head loops
+
+### Fixed
+- `parse_json_string` now correctly decodes UTF-16 surrogate pairs (emoji, Mathematical Alphanumeric Symbols, CJK Extension B) from `tokenizer.json`; previously, lone high surrogates were silently dropped; a lone `\uD800` now returns `Err` instead of being ignored (`src/tokenizer.rs`)
+
+### Known Issues
+- When the `onnx` feature is enabled, `Cargo.lock` contains both `oxifft 0.2.0` (transitive via `oxionnx-ops 0.1.2`) and `oxifft 0.3.0` (direct dependency). This is a transient state until `oxionnx-ops` releases a version that upgrades to `oxifft 0.3+`. The duplicate has zero impact when the `onnx` feature is disabled (the default). Track: https://github.com/cool-japan/oxionnx
+
 ## [0.1.0] - 2026-03-27
 
 ### Added

@@ -1,7 +1,8 @@
 //! Criterion benchmarks for oxiwhisper inference pipeline components.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::f32::consts::PI;
+use std::hint::black_box;
 
 /// Generate a sine wave at the given frequency.
 fn sine_wave(freq_hz: f32, sample_rate: usize, n_samples: usize) -> Vec<f32> {

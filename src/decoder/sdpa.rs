@@ -488,6 +488,14 @@ fn sdpa_prefill_one_head(
 /// Uses `matrixmultiply::sgemm` for both QK^T and scores@V.
 /// Each head writes into a head-major per-head buffer, then a serial stitch
 /// copies the results into the interleaved output `[q_len, n_state]`.
+///
+/// `capture` is an optional out-parameter of shape `[q_len * kv_len]`.  When
+/// `Some`, the post-softmax attention matrix is averaged over all heads and
+/// written to the slice.  The reduction runs AFTER the parallel/serial section
+/// completes — no `&mut` crosses the rayon closure boundary, so there is no
+/// aliasing hazard.  The `None` path is byte-for-byte identical to the
+/// pre-capture code (no extra allocation, no branch overhead in the hot loop).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scaled_dot_product_flat(
     q: &[f32], // [n_head, q_len, head_dim]
     k: &[f32], // [n_head, kv_len, head_dim]  (pre-built, tightly packed)
@@ -496,6 +504,7 @@ pub(crate) fn scaled_dot_product_flat(
     q_len: usize,
     kv_len: usize,
     head_dim: usize,
+    capture: Option<&mut [f32]>, // NEW: [q_len * kv_len] mean-over-heads sink
 ) -> Vec<f32> {
     let scale = (head_dim as f32).sqrt().recip();
     let n_state = n_head * head_dim;
@@ -544,6 +553,24 @@ pub(crate) fn scaled_dot_product_flat(
             let dst = &mut out[i * n_state + h * head_dim..i * n_state + (h + 1) * head_dim];
             let src = &head_out[h][i * head_dim..(i + 1) * head_dim];
             dst.copy_from_slice(src);
+        }
+    }
+
+    // Optionally capture the post-softmax head-mean attention matrix.
+    // Runs AFTER the parallel section — no &mut crosses the rayon closure.
+    if let Some(dst) = capture {
+        debug_assert_eq!(dst.len(), q_len * kv_len);
+        let inv_h = (n_head as f32).recip();
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
+        for sh in head_scores.iter().take(n_head) {
+            for (d, &s) in dst.iter_mut().zip(sh.iter()) {
+                *d += s;
+            }
+        }
+        for v in dst.iter_mut() {
+            *v *= inv_h;
         }
     }
 
@@ -611,6 +638,10 @@ fn sdpa_flat_one_head(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sdpa_tests.rs"]
+mod tests;
 
 /// Apply row-wise softmax in-place to a `[rows, cols]` score matrix.
 pub(crate) fn softmax_rows(scores: &mut [f32], rows: usize, cols: usize) {

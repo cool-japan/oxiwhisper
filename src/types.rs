@@ -21,6 +21,19 @@ pub enum KvCacheDtype {
     KvHalf,
 }
 
+/// Decoding task: transcribe speech or translate it to English.
+///
+/// Passed via [`TranscribeOptions::task`]. The default is [`Task::Transcribe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Task {
+    /// Transcribe audio in its source language (default).
+    #[default]
+    Transcribe,
+    /// Translate audio to English regardless of source language.
+    Translate,
+}
+
 /// Top-level error type for oxiwhisper.
 #[derive(Debug)]
 pub enum OxiWhisperError {
@@ -103,6 +116,41 @@ pub struct TranscribeOptions<'a> {
     /// behaviour unchanged. Use `VHalf` or `KvHalf` to reduce peak memory
     /// usage for large models or long sequences.
     pub kv_cache_dtype: KvCacheDtype,
+    /// Decoding task: transcribe or translate to English. Default is [`Task::Transcribe`].
+    pub task: Task,
+    /// Temperature fallback schedule (OpenAI-style robustness).
+    ///
+    /// When non-empty, the decoder tries each temperature in order and accepts
+    /// the first result that is not degenerate (low char-entropy or low avg log-prob).
+    /// If all attempts fail the last attempt is returned. An empty slice (default)
+    /// disables fallback and preserves current single-dispatch behaviour.
+    pub fallback_temperatures: &'a [f32],
+    /// Average log-probability threshold for the temperature fallback gate.
+    ///
+    /// A decode attempt is considered degenerate when its mean per-token log-probability
+    /// is below this value (more negative). Default `-1.0` matches OpenAI Whisper.
+    /// Only evaluated when [`fallback_temperatures`](Self::fallback_temperatures) is non-empty.
+    pub logprob_threshold: f32,
+    /// Capture cross-attention weights and produce word-level timestamps via DTW.
+    ///
+    /// When `true`, the decoder accumulates head- and layer-averaged cross-attention
+    /// matrices during decoding and aligns them with output tokens using Dynamic Time
+    /// Warping. The result is accessible via
+    /// [`WhisperModel::transcribe_words`](crate::WhisperModel::transcribe_words).
+    ///
+    /// Default `false` (zero cost). Requires `beam_width == 1`.
+    pub word_timestamps: bool,
+    /// Probability threshold for the `<|nospeech|>` silence gate (default `0.6`).
+    ///
+    /// A segment is treated as non-speech when its `no_speech_prob` exceeds this
+    /// value **and** its average log-probability is below
+    /// [`logprob_threshold`](Self::logprob_threshold). Set to `1.0` to disable the
+    /// gate. Must be in `[0.0, 1.0]`.
+    pub no_speech_threshold: f32,
+    /// Suppress the leading-space token and EOT on the first decoded position
+    /// (OpenAI's `suppress_blank`). Prevents transcripts from beginning with
+    /// whitespace or terminating immediately. Default `true` (OpenAI parity).
+    pub suppress_blank: bool,
 }
 
 impl Default for TranscribeOptions<'static> {
@@ -120,6 +168,12 @@ impl Default for TranscribeOptions<'static> {
             compression_ratio_threshold: 2.4,
             previous_tokens: None,
             kv_cache_dtype: KvCacheDtype::F32,
+            task: Task::Transcribe,
+            fallback_temperatures: &[],
+            logprob_threshold: -1.0,
+            word_timestamps: false,
+            no_speech_threshold: 0.6,
+            suppress_blank: true,
         }
     }
 }
@@ -242,6 +296,16 @@ pub(crate) fn validate_options(opts: &TranscribeOptions<'_>) -> Result<(), OxiWh
             "top_p must be in (0.0, 1.0]".into(),
         ));
     }
+    if opts.fallback_temperatures.iter().any(|&t| t < 0.0) {
+        return Err(OxiWhisperError::ConfigError(
+            "fallback_temperatures must not contain negative values".into(),
+        ));
+    }
+    if opts.no_speech_threshold < 0.0 || opts.no_speech_threshold > 1.0 {
+        return Err(OxiWhisperError::ConfigError(
+            "no_speech_threshold must be in [0.0, 1.0]".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -275,5 +339,102 @@ mod tests {
         };
         let cloned = opts.clone();
         assert_eq!(cloned.previous_tokens, Some(&tokens[..]));
+    }
+
+    #[test]
+    fn test_task_default_is_transcribe() {
+        let opts = TranscribeOptions::default();
+        assert_eq!(opts.task, Task::Transcribe);
+    }
+
+    #[test]
+    fn test_task_translate_roundtrip() {
+        let opts = TranscribeOptions {
+            task: Task::Translate,
+            ..TranscribeOptions::default()
+        };
+        assert_eq!(opts.task, Task::Translate);
+        let cloned = opts.clone();
+        assert_eq!(cloned.task, Task::Translate);
+    }
+
+    #[test]
+    fn test_fallback_temperatures_default_empty() {
+        let opts = TranscribeOptions::default();
+        assert!(opts.fallback_temperatures.is_empty());
+        assert_eq!(opts.logprob_threshold, -1.0);
+    }
+
+    #[test]
+    fn test_validate_options_rejects_negative_fallback_temp() {
+        let temps = [-0.1f32];
+        let opts = TranscribeOptions {
+            fallback_temperatures: &temps,
+            ..TranscribeOptions::default()
+        };
+        let err = validate_options(&opts);
+        assert!(err.is_err());
+        let msg = format!("{}", err.expect_err("already checked"));
+        assert!(msg.contains("fallback_temperatures"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_validate_options_accepts_zero_in_fallback_schedule() {
+        let temps = [0.0f32, 0.2, 0.4];
+        let opts = TranscribeOptions {
+            fallback_temperatures: &temps,
+            ..TranscribeOptions::default()
+        };
+        assert!(validate_options(&opts).is_ok());
+    }
+
+    #[test]
+    fn test_word_timestamps_default_false() {
+        let opts = TranscribeOptions::default();
+        assert!(!opts.word_timestamps);
+    }
+
+    #[test]
+    fn test_no_speech_threshold_default_is_0_6() {
+        let opts = TranscribeOptions::default();
+        assert!((opts.no_speech_threshold - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_suppress_blank_default_true() {
+        let opts = TranscribeOptions::default();
+        assert!(opts.suppress_blank);
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_no_speech_threshold() {
+        let opts = TranscribeOptions {
+            no_speech_threshold: 1.5,
+            ..TranscribeOptions::default()
+        };
+        assert!(validate_options(&opts).is_err());
+
+        let opts = TranscribeOptions {
+            no_speech_threshold: -0.1,
+            ..TranscribeOptions::default()
+        };
+        let err = validate_options(&opts);
+        assert!(err.is_err());
+        let msg = format!("{}", err.expect_err("already checked"));
+        assert!(msg.contains("no_speech_threshold"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_validate_accepts_boundary_no_speech_threshold() {
+        for &t in &[0.0f32, 0.5, 1.0] {
+            let opts = TranscribeOptions {
+                no_speech_threshold: t,
+                ..TranscribeOptions::default()
+            };
+            assert!(
+                validate_options(&opts).is_ok(),
+                "threshold {t} should be valid"
+            );
+        }
     }
 }

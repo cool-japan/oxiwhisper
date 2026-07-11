@@ -8,14 +8,17 @@
 //!
 //! ## Quick Start
 //!
-//! ```ignore
-//! use oxiwhisper::{WhisperModel, TranscribeOptions};
+//! ```no_run
+//! use oxiwhisper::{TranscribeOptions, WhisperModel};
 //! use std::path::Path;
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let model = WhisperModel::from_file(Path::new("ggml-tiny.bin"))?;
 //! let audio = oxiwhisper::audio::load_wav(Path::new("audio.wav"))?;
 //! let text = model.transcribe(&audio, &TranscribeOptions::default())?;
 //! println!("{text}");
+//! # Ok(())
+//! # }
 //! ```
 
 #![warn(missing_docs)]
@@ -30,6 +33,10 @@ pub mod beam_search;
 pub mod decode_utils;
 /// Core Whisper text decoder (forward pass, KV cache, sampling).
 pub mod decoder;
+/// Speaker diarization ("who spoke when"): segmentation, embedding, clustering
+/// (D2-D4) and resegmentation plus the end-to-end pipeline (D5) are implemented.
+#[cfg(feature = "diarization")]
+pub mod diarize;
 /// Dynamic Time Warping utilities for word-level timestamp alignment.
 pub mod dtw;
 /// Whisper audio encoder (CNN + Transformer).
@@ -68,10 +75,26 @@ pub mod tokenizer;
 pub mod types;
 /// Voice activity detection (energy-based silence segmentation).
 pub mod vad;
+/// Word-level timestamp alignment via cross-attention DTW.
+pub mod word_timestamps;
 
 mod whisper_model;
 
+#[cfg(feature = "diarization")]
+pub use diarize::attribute::{SpeakerTranscript, SpeakerTurn};
+#[cfg(all(feature = "diarization", feature = "onnx"))]
+pub use diarize::embed::EcapaOnnx;
+#[cfg(feature = "diarization")]
+pub use diarize::embed::{SpeakerEmbedder, WhisperEncoderEmbedder};
+#[cfg(feature = "diarization")]
+pub use diarize::format::{labeled_transcript, labeled_transcript_timed, rttm_string, write_rttm};
+#[cfg(feature = "diarization")]
+pub use diarize::metrics::{DerOptions, DerReport, RttmSegment, der, hungarian, jer, parse_rttm};
+#[cfg(feature = "diarization")]
+pub use diarize::{ClusteringMethod, DiarizeOptions, DiarizeResult, SpeakerId, SpeakerSegment};
+pub use dtw::WordSegment;
 pub use types::*;
+pub use word_timestamps::WordTimedTranscript;
 
 use std::sync::Arc;
 

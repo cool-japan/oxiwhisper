@@ -8,6 +8,13 @@ pub(crate) struct DecodeConstraints<'a> {
     pub(crate) suppress: &'a [u32],
     /// N-gram size for repetition blocking (0 = disabled).
     pub(crate) no_repeat_ngram_size: usize,
+    /// Apply OpenAI `ApplyTimestampRules` logit enforcement at each step.
+    /// Enabled automatically when `TranscribeOptions::timestamps == true`.
+    pub(crate) timestamp_rules: bool,
+    /// Suppress the leading-space token and EOT on the first decoded position.
+    pub(crate) suppress_blank: bool,
+    /// Token ID of the leading-space "blank" token, if found in the model vocab.
+    pub(crate) blank_token: Option<u32>,
 }
 
 /// Shared arguments for greedy / beam / sample decoders.
@@ -170,6 +177,131 @@ pub(crate) fn apply_suppress_tokens(logits: &mut [f32], suppress: &[u32]) {
     for &tok in suppress {
         if (tok as usize) < logits.len() {
             logits[tok as usize] = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// Stable softmax probability of a single token given logits.
+///
+/// Returns a value in `[0, 1]`. Equivalent to `exp(token_log_prob(logits, token))`.
+/// Capture this BEFORE any logit suppression to avoid zeroing the target token.
+pub(crate) fn token_prob(logits: &[f32], token: u32) -> f32 {
+    token_log_prob(logits, token).exp()
+}
+
+/// Suppress the leading-space "blank" token and EOT on the first decoded position.
+///
+/// Matches OpenAI's `SuppressBlank` filter. Applied only at decode step 0 to prevent
+/// transcripts from beginning with whitespace or terminating immediately.
+/// `blank_token` is `None` when the model vocab has no single leading-space entry.
+pub(crate) fn apply_suppress_blank(
+    logits: &mut [f32],
+    special: &crate::tokenizer::SpecialTokens,
+    blank_token: Option<u32>,
+) {
+    if (special.eot as usize) < logits.len() {
+        logits[special.eot as usize] = f32::NEG_INFINITY;
+    }
+    if let Some(b) = blank_token
+        && (b as usize) < logits.len()
+    {
+        logits[b as usize] = f32::NEG_INFINITY;
+    }
+}
+
+/// Apply OpenAI's `ApplyTimestampRules` logit filter in place.
+///
+/// Enforces four timestamp invariants before sampling each token when timestamps
+/// are enabled:
+/// - **(a)** `<|notimestamps|>` is always suppressed;
+/// - **(b)** Timestamps are emitted in non-decreasing pairs: force-text after a complete
+///   pair, force-timestamp after a lone timestamp, monotonic lower bound;
+/// - **(c)** Force a timestamp when total timestamp probability mass exceeds the
+///   highest individual text-token probability.
+///
+/// `generated` is the sequence of output tokens emitted so far (excluding prompt).
+/// Must be called AFTER `apply_suppress_tokens` and `apply_no_repeat_ngram` but
+/// BEFORE the argmax/sample step.
+pub(crate) fn apply_timestamp_rules(
+    logits: &mut [f32],
+    generated: &[u32],
+    special: &crate::tokenizer::SpecialTokens,
+) {
+    use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+    let ts_begin = TIMESTAMP_BEGIN as usize;
+    let vocab = logits.len();
+    if ts_begin >= vocab {
+        return; // degenerate vocab without timestamp tokens
+    }
+
+    // (a) Always suppress <|notimestamps|>.
+    if (special.no_timestamps as usize) < vocab {
+        logits[special.no_timestamps as usize] = f32::NEG_INFINITY;
+    }
+
+    // (b) Pair and monotonic enforcement based on the last 1-2 emitted tokens.
+    let last_was_ts = generated
+        .last()
+        .is_some_and(|&t| SpecialTokens::is_timestamp(t));
+    let penult_was_ts = generated
+        .len()
+        .checked_sub(2)
+        .map(|i| SpecialTokens::is_timestamp(generated[i]))
+        .unwrap_or(false);
+
+    if last_was_ts {
+        if penult_was_ts {
+            // Complete pair just closed → force text next.
+            for l in &mut logits[ts_begin..] {
+                *l = f32::NEG_INFINITY;
+            }
+        } else {
+            // Lone timestamp → force another timestamp to close the pair.
+            // All text tokens (including EOT) are suppressed; the model must
+            // emit a closing timestamp before any further text or termination.
+            for l in logits[..ts_begin].iter_mut() {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    // Monotonic lower bound: suppress timestamps strictly below the last emitted one.
+    if let Some(&last_ts) = generated
+        .iter()
+        .rev()
+        .find(|&&t| SpecialTokens::is_timestamp(t))
+    {
+        let lo = (last_ts as usize).min(vocab);
+        for l in &mut logits[ts_begin..lo] {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+
+    // (c) Force timestamp when total timestamp mass dominates the best text token.
+    // The log-softmax normaliser is the same for all tokens, so it cancels and we
+    // compare raw logits directly. Use a local numerically-stable logsumexp over
+    // the timestamp tail to avoid a full-vocab allocation.
+    let best_text = logits[..ts_begin]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let ts_max = logits[ts_begin..]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    if ts_max.is_finite() {
+        let ts_logsumexp = ts_max
+            + logits[ts_begin..]
+                .iter()
+                .map(|&x| (x - ts_max).exp())
+                .sum::<f32>()
+                .ln();
+        if ts_logsumexp > best_text {
+            // Use split_at_mut to avoid borrow aliasing.
+            let (text_part, _) = logits.split_at_mut(ts_begin);
+            for l in text_part.iter_mut() {
+                *l = f32::NEG_INFINITY;
+            }
         }
     }
 }
@@ -500,5 +632,191 @@ mod tests {
             lp1 > lp0,
             "token 1 should have higher log_prob than token 0"
         );
+    }
+
+    // ── token_prob tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_token_prob_in_unit_interval() {
+        let logits = vec![1.0f32, 2.0, 3.0, 0.5, -1.0];
+        for i in 0..logits.len() {
+            let p = token_prob(&logits, i as u32);
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "token_prob[{i}] = {p} not in [0,1]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_token_prob_sums_to_one() {
+        let logits = vec![1.0f32, 2.0, 3.0];
+        let total: f32 = (0..logits.len())
+            .map(|i| token_prob(&logits, i as u32))
+            .sum();
+        assert!((total - 1.0).abs() < 1e-5, "sum = {total}");
+    }
+
+    #[test]
+    fn test_token_prob_out_of_range_returns_zero() {
+        let logits = vec![1.0f32, 2.0, 3.0];
+        let p = token_prob(&logits, 100);
+        assert_eq!(p, 0.0);
+    }
+
+    // ── apply_suppress_blank tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_suppress_blank_suppresses_eot_and_blank() {
+        use crate::tokenizer::SpecialTokens;
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        logits[special.eot as usize] = 5.0;
+        logits[220] = 5.0; // typical space token
+        apply_suppress_blank(&mut logits, &special, Some(220));
+        assert_eq!(
+            logits[special.eot as usize],
+            f32::NEG_INFINITY,
+            "eot must be suppressed"
+        );
+        assert_eq!(logits[220], f32::NEG_INFINITY, "blank must be suppressed");
+        assert_eq!(logits[100], 0.0, "other tokens must be unaffected");
+    }
+
+    #[test]
+    fn test_suppress_blank_none_blank_suppresses_only_eot() {
+        use crate::tokenizer::SpecialTokens;
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        logits[special.eot as usize] = 5.0;
+        logits[220] = 5.0;
+        apply_suppress_blank(&mut logits, &special, None);
+        assert_eq!(logits[special.eot as usize], f32::NEG_INFINITY);
+        assert_eq!(
+            logits[220], 5.0,
+            "without blank_token, space should not be suppressed"
+        );
+    }
+
+    // ── apply_timestamp_rules tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_timestamp_rules_suppresses_notimestamps() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        apply_timestamp_rules(&mut logits, &[], &special);
+        assert_eq!(
+            logits[special.no_timestamps as usize],
+            f32::NEG_INFINITY,
+            "no_timestamps must always be suppressed"
+        );
+        // Timestamp tokens at TIMESTAMP_BEGIN should still be finite (empty generated)
+        assert!(logits[TIMESTAMP_BEGIN as usize].is_finite());
+    }
+
+    #[test]
+    fn test_timestamp_rules_force_text_after_pair() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        let generated = [TIMESTAMP_BEGIN, TIMESTAMP_BEGIN + 2]; // two timestamps
+        apply_timestamp_rules(&mut logits, &generated, &special);
+        // All timestamp logits must be NEG_INFINITY
+        for (i, &l) in logits[TIMESTAMP_BEGIN as usize..].iter().enumerate() {
+            assert_eq!(
+                l,
+                f32::NEG_INFINITY,
+                "ts_logit[{i}] should be -inf after pair"
+            );
+        }
+        // Text token (e.g. 100) must still be finite
+        assert!(logits[100].is_finite(), "text token should be unaffected");
+    }
+
+    #[test]
+    fn test_timestamp_rules_force_timestamp_after_lone() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        let generated = [100u32, TIMESTAMP_BEGIN + 5]; // last is lone timestamp
+        apply_timestamp_rules(&mut logits, &generated, &special);
+        // ALL text tokens (including EOT) must be suppressed — the model must
+        // emit a closing timestamp before it can output text or terminate.
+        // This matches OpenAI's ApplyTimestampRules: `logits[:, :TIMESTAMP_BEGIN] = -inf`.
+        for (i, &l) in logits[..TIMESTAMP_BEGIN as usize].iter().enumerate() {
+            assert_eq!(
+                l,
+                f32::NEG_INFINITY,
+                "text_logit[{i}] should be -inf after lone ts"
+            );
+        }
+        // Timestamps at or above the monotonic floor must be finite.
+        assert!(logits[(TIMESTAMP_BEGIN + 5) as usize].is_finite());
+    }
+
+    #[test]
+    fn test_timestamp_rules_monotonic_floor() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![1.0f32; 51865];
+        let generated = [100u32, 200, TIMESTAMP_BEGIN + 100]; // last ts at +100
+        apply_timestamp_rules(&mut logits, &generated, &special);
+        // Timestamps below TIMESTAMP_BEGIN+100 must be NEG_INFINITY
+        let floor_start = TIMESTAMP_BEGIN as usize;
+        let floor_end = (TIMESTAMP_BEGIN + 100) as usize;
+        for (i, &l) in logits[floor_start..floor_end].iter().enumerate() {
+            let abs_i = floor_start + i;
+            assert_eq!(
+                l,
+                f32::NEG_INFINITY,
+                "ts[{abs_i}] below floor should be -inf"
+            );
+        }
+        // At and above the floor must be finite
+        assert!(logits[(TIMESTAMP_BEGIN + 100) as usize].is_finite());
+        assert!(logits[(TIMESTAMP_BEGIN + 200) as usize].is_finite());
+    }
+
+    #[test]
+    fn test_timestamp_rules_mass_dominance_forces_timestamp() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        // Make timestamp region dominate: high values for timestamps, low for text
+        for l in &mut logits[TIMESTAMP_BEGIN as usize..] {
+            *l = 10.0;
+        }
+        for l in &mut logits[..TIMESTAMP_BEGIN as usize] {
+            *l = -10.0;
+        }
+        apply_timestamp_rules(&mut logits, &[], &special);
+        // Text region (except eot) should be NEG_INFINITY or unchanged —
+        // due to the mass-dominance rule all text logits become NEG_INFINITY
+        for (i, &l) in logits[..TIMESTAMP_BEGIN as usize].iter().enumerate() {
+            if i as u32 != special.eot && i as u32 != special.no_timestamps {
+                assert_eq!(
+                    l,
+                    f32::NEG_INFINITY,
+                    "text_logit[{i}] should be -inf when ts dominates"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_timestamp_rules_no_nan_when_ts_region_masked() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        // First call: force-text-after-pair (masks all ts logits to -inf)
+        let generated_pair = [TIMESTAMP_BEGIN, TIMESTAMP_BEGIN + 1];
+        apply_timestamp_rules(&mut logits, &generated_pair, &special);
+        // Second call: ts region is now all -inf; rule (c) should not produce NaN
+        let mut logits2 = logits.clone();
+        apply_timestamp_rules(&mut logits2, &[], &special);
+        for (i, &l) in logits2.iter().enumerate() {
+            assert!(!l.is_nan(), "logit[{i}] must not be NaN");
+        }
     }
 }

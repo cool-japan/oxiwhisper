@@ -1,0 +1,23 @@
+# SplitRS configuration for oxiwhisper.
+#
+# Enforces this project's refactoring policy: a single source file should
+# stay under 2000 lines. Run `splitrs --dry-run -i <file> -o <dir>` (or
+# `splitrs --workspace --dry-run`) to preview a split before committing to it.
+#
+# Schema reference: splitrs::config::Config (crates.io "splitrs", see
+# `splitrs --help` for the equivalent CLI flags, which override this file).
+
+[splitrs]
+# Target module size used by the default heuristic splitter.
+max_lines = 2000
+
+# Impl blocks are split only when explicitly requested via --split-impl-blocks.
+max_impl_lines = 2000
+split_impl_blocks = false
+
+[naming]
+use_snake_case = true
+
+[output]
+preserve_comments = true
+format_output = true

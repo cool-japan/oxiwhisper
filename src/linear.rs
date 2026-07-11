@@ -613,23 +613,61 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_product_simd_path_active() {
-        // Verify we are using the expected SIMD path on the current platform
+    fn test_dot_product_dispatch_matches_scalar_reference() {
+        // This test must verify a FACT ABOUT THE CRATE (dispatch correctness),
+        // never a fact about the host CPU or interpreter. A prior version of
+        // this test asserted `is_x86_feature_detected!("avx2") && ("fma")`
+        // directly, which fails on any x86_64 host lacking AVX2/FMA and under
+        // Miri (which always reports the feature absent, since it interprets
+        // MIR rather than running real CPUID). Instead: build an independent
+        // scalar reference, then check that whichever path `dot_product`
+        // actually dispatches to on this host agrees with it, and — when
+        // AVX2+FMA genuinely are available — additionally exercise the AVX2
+        // kernel directly so the intrinsic path itself is checked, not merely
+        // "some path produced approximately the right answer".
+        //
+        // Length 37 is not a multiple of 8 (AVX2) or 4 (NEON), so both the
+        // vectorised chunks and the scalar remainder loop are exercised.
+        let n = 37;
+        let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.037 - 0.5).collect();
+        let b: Vec<f32> = (0..n).map(|i| 1.0 - (i as f32) * 0.021).collect();
+        let scalar_reference = dot_scalar(&a, &b);
+
+        // `dot_product` is the public dispatcher: regardless of which path it
+        // picks on this host, it must agree with the scalar reference.
+        let dispatched = super::dot_product(&a, &b);
+        assert!(
+            (dispatched - scalar_reference).abs() < 1e-3,
+            "dot_product() dispatch diverged from scalar reference: dispatched={dispatched}, scalar={scalar_reference}"
+        );
+
         #[cfg(target_arch = "x86_64")]
         {
-            assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
-                "AVX2+FMA should be available on this x86_64 machine"
-            );
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // AVX2+FMA genuinely available on this host: confirm the
+                // intrinsic kernel itself (not just the dispatcher) is correct.
+                // SAFETY: feature detection just above confirmed AVX2 + FMA.
+                let avx2_result = unsafe { simd_x86::dot_avx2(&a, &b) };
+                assert!(
+                    (avx2_result - scalar_reference).abs() < 1e-3,
+                    "AVX2 kernel diverged from scalar reference: avx2={avx2_result}, scalar={scalar_reference}"
+                );
+            }
+            // Else: no AVX2/FMA on this host (or running under Miri). There is
+            // nothing further to check — `dot_product` necessarily took the
+            // scalar path, and that was already verified above. Do NOT fail
+            // just because the host/interpreter lacks a CPU feature.
         }
+
         #[cfg(target_arch = "aarch64")]
         {
-            // NEON is always available on aarch64 — nothing to check,
-            // but confirm dot_product works through the NEON path.
-            let a = [1.0f32; 16];
-            let b = [2.0f32; 16];
-            let r = super::dot_product(&a, &b);
-            assert!((r - 32.0).abs() < 1e-4, "NEON path produced {r}");
+            // NEON is always available on aarch64 — exercise the kernel
+            // directly in addition to the dispatcher check above.
+            let neon_result = simd_neon::dot_neon(&a, &b);
+            assert!(
+                (neon_result - scalar_reference).abs() < 1e-3,
+                "NEON kernel diverged from scalar reference: neon={neon_result}, scalar={scalar_reference}"
+            );
         }
     }
 

@@ -1,8 +1,38 @@
 //! Synthetic model generators for integration tests.
 //!
 //! Produces minimal valid GGML and GGUF Whisper model binaries with deterministic
-//! weights. Models will not produce meaningful transcriptions but will exercise
-//! the full load path without crashing.
+//! weights that exercise the full load path without crashing.
+//!
+//! # Designed decoding behaviour
+//!
+//! Unlike a purely random synthetic model (which drives the decoder into a
+//! degenerate constant-token loop and yields empty text / empty segments), the
+//! weights here are *crafted* so the greedy decoder walks a fixed, deterministic
+//! token chain that produces real text and properly paired timestamps.
+//!
+//! The construction relies on three facts about the decoder
+//! (`crate::decoder::forward`):
+//! 1. the residual stream at step `t` is `token_embedding[cur] + positional_embedding[t]`
+//!    once the attention / MLP **output projections** are zeroed (so the blocks add
+//!    nothing to the residual);
+//! 2. the final layer norm is made a pure normalisation (`weight = 1`, `bias = 0`);
+//! 3. logits are `hidden @ token_embedding^T` (the embedding table is tied).
+//!
+//! Each designed token `v` is given a **one-hot** embedding row `S · e_{dim(v)}`
+//! (distinct dimension per token), so `logits[v] ≈ S · hidden[dim(v)]`. The
+//! positional embedding at position `t` is set to `P · e_{dim(target)}` with
+//! `P > S`, so the positional term dominates the argmax and steers step `t`
+//! onto the designed `target` token — while satisfying OpenAI's
+//! `apply_timestamp_rules` masking (see [`crate::decode_utils`]).
+//!
+//! With timestamps enabled the emitted sequence (excluding the prompt) is:
+//! `<|0.00|> <|0.00|> hello <|1.00|> <|1.00|> world <|2.00|> <|2.00|>` then
+//! `<|endoftext|>`, which [`crate::tokenizer::parse_segments`] turns into two
+//! segments `(0.00–1.00, "hello")` and `(1.00–2.00, "world")`. The doubled
+//! timestamps are forced by this crate's pair rule (a lone timestamp must be
+//! followed by another timestamp before any text).
+//!
+//! See `design_override` and `DESIGN_TOKENS` for the concrete weights.
 
 use std::path::PathBuf;
 
@@ -293,13 +323,13 @@ pub fn generate_synthetic_gguf(spec: &SyntheticSpec) -> Vec<u8> {
 
         if desc.is_f16 {
             for i in 0..n_elements {
-                let v = deterministic_value(name_hash, i);
+                let v = tensor_element_value(&desc.name, name_hash, i, &desc.shape);
                 let h = half::f16::from_f32(v);
                 buf.extend_from_slice(&h.to_le_bytes());
             }
         } else {
             for i in 0..n_elements {
-                let v = deterministic_value(name_hash, i);
+                let v = tensor_element_value(&desc.name, name_hash, i, &desc.shape);
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -388,7 +418,7 @@ fn write_ggml_mel_filters(buf: &mut Vec<u8>, spec: &SyntheticSpec) {
 fn write_ggml_vocab(buf: &mut Vec<u8>, spec: &SyntheticSpec) {
     write_i32_le(buf, spec.n_vocab as i32);
     for i in 0..spec.n_vocab {
-        let token = format!("<|{i}|>");
+        let token = designed_vocab_text(i);
         let bytes = token.as_bytes();
         write_i32_le(buf, bytes.len() as i32);
         buf.extend_from_slice(bytes);
@@ -400,7 +430,7 @@ fn write_ggml_tensor_f32(buf: &mut Vec<u8>, name: &str, shape: &[usize]) {
     let n_elements: usize = shape.iter().product();
     let name_hash = simple_hash(name);
     for i in 0..n_elements {
-        let v = deterministic_value(name_hash, i);
+        let v = tensor_element_value(name, name_hash, i, shape);
         buf.extend_from_slice(&v.to_le_bytes());
     }
 }
@@ -410,7 +440,7 @@ fn write_ggml_tensor_f16(buf: &mut Vec<u8>, name: &str, shape: &[usize]) {
     let n_elements: usize = shape.iter().product();
     let name_hash = simple_hash(name);
     for i in 0..n_elements {
-        let v = deterministic_value(name_hash, i);
+        let v = tensor_element_value(name, name_hash, i, shape);
         let h = half::f16::from_f32(v);
         buf.extend_from_slice(&h.to_le_bytes());
     }
@@ -500,7 +530,7 @@ fn build_kv_entries(spec: &SyntheticSpec) -> Vec<(String, Vec<u8>)> {
         v.extend_from_slice(&8u32.to_le_bytes()); // elem type = String
         v.extend_from_slice(&(spec.n_vocab as u64).to_le_bytes());
         for i in 0..spec.n_vocab {
-            let token = format!("<|{i}|>");
+            let token = designed_vocab_text(i);
             let bytes = token.as_bytes();
             v.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             v.extend_from_slice(bytes);
@@ -540,6 +570,159 @@ fn write_u64_le(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+// ── Designed decoding weights ────────────────────────────────────────────────
+
+/// One-hot magnitude `S` written into a designed token's embedding row.
+const DESIGN_EMB_SCALE: f32 = 1.0;
+
+/// Positional steering magnitude `P`. Must exceed [`DESIGN_EMB_SCALE`] so the
+/// positional term at step `t` beats the previous token's embedding term and
+/// the argmax lands on the designed target rather than repeating the last token.
+const DESIGN_POS_SCALE: f32 = 4.0;
+
+/// Whisper `<|endoftext|>` token id (stop token).
+const TOK_EOT: u32 = 50256;
+/// Timestamp token for 0.00s (`TIMESTAMP_BEGIN`).
+const TOK_TS0: u32 = 50364;
+/// Timestamp token for 1.00s (`TIMESTAMP_BEGIN + 50`).
+const TOK_TS1: u32 = 50414;
+/// Timestamp token for 2.00s (`TIMESTAMP_BEGIN + 100`).
+const TOK_TS2: u32 = 50464;
+/// Text token id emitted as the first word ("hello").
+const TOK_HELLO: u32 = 1000;
+/// Text token id emitted as the second word (" world").
+const TOK_WORLD: u32 = 2000;
+
+/// Designed `(token_id, embedding_dimension)` pairs. Each dimension is unique so
+/// the one-hot rows stay orthogonal and `logits[token] ≈ S · hidden[dim]`.
+const DESIGN_TOKENS: [(u32, usize); 6] = [
+    (TOK_TS0, 0),
+    (TOK_HELLO, 1),
+    (TOK_TS1, 2),
+    (TOK_WORLD, 3),
+    (TOK_TS2, 4),
+    (TOK_EOT, 5),
+];
+
+/// Designed `(decoder position, steering dimension)` pairs.
+///
+/// Position `p` steers the token generated *from* that position onto the token
+/// owning that dimension. Positions 2–10 cover the greedy walk for a
+/// timestamps-enabled prompt (`[sot, lang, transcribe]`, length 3, so the first
+/// generated token is driven by `positional_embedding[2]`). A timestamps-
+/// disabled prompt is one token longer, which simply shifts the same table by
+/// one and yields `hello world` after timestamp stripping.
+const DESIGN_POSITIONS: [(usize, usize); 9] = [
+    (2, 0),  // <|0.00|>
+    (3, 0),  // <|0.00|>  (pair-closing timestamp forced by the lone-timestamp rule)
+    (4, 1),  // hello
+    (5, 2),  // <|1.00|>
+    (6, 2),  // <|1.00|>
+    (7, 3),  // world
+    (8, 4),  // <|2.00|>
+    (9, 4),  // <|2.00|>
+    (10, 5), // <|endoftext|>
+];
+
+/// Return the designed embedding dimension for a token id, if it is a designed token.
+fn designed_token_dim(token: u32) -> Option<usize> {
+    DESIGN_TOKENS
+        .iter()
+        .find(|&&(t, _)| t == token)
+        .map(|&(_, d)| d)
+}
+
+/// Return the designed steering dimension for a decoder position, if steered.
+fn designed_pos_dim(pos: usize) -> Option<usize> {
+    DESIGN_POSITIONS
+        .iter()
+        .find(|&&(p, _)| p == pos)
+        .map(|&(_, d)| d)
+}
+
+/// `true` for the decoder block output projections (weight and bias) that are
+/// zeroed to neutralise the transformer blocks so the residual stream carries
+/// only `token_embedding + positional_embedding`.
+fn is_neutralised_tensor(name: &str) -> bool {
+    if !name.starts_with("decoder.blocks.") {
+        return false;
+    }
+    name.ends_with(".attn.out.weight")
+        || name.ends_with(".attn.out.bias")
+        || name.ends_with(".cross_attn.out.weight")
+        || name.ends_with(".cross_attn.out.bias")
+        || name.ends_with(".mlp.2.weight")
+        || name.ends_with(".mlp.2.bias")
+}
+
+/// Override the default random weight for a tensor element when the designed
+/// decoding construction requires a specific value.
+///
+/// `shape` is the tensor's shape; for the embedding tables the inner (row)
+/// dimension is `shape[0]` (GGML `ne[0]`, the fastest-varying axis), matching
+/// how `crate::decoder::forward` indexes them (`data[index * n_state + dim]`).
+///
+/// Returns `None` to fall back to [`deterministic_value`].
+fn design_override(name: &str, index: usize, shape: &[usize]) -> Option<f32> {
+    // Neutralise the transformer block output projections.
+    if is_neutralised_tensor(name) {
+        return Some(0.0);
+    }
+    // Make the final layer norm a pure normalisation.
+    if name == "decoder.ln.weight" {
+        return Some(1.0);
+    }
+    if name == "decoder.ln.bias" {
+        return Some(0.0);
+    }
+    // One-hot embedding rows for the designed tokens.
+    if name == "decoder.token_embedding.weight" {
+        let n_state = shape[0];
+        let token = (index / n_state) as u32;
+        let dim = index % n_state;
+        if let Some(target_dim) = designed_token_dim(token) {
+            return Some(if dim == target_dim {
+                DESIGN_EMB_SCALE
+            } else {
+                0.0
+            });
+        }
+        return None;
+    }
+    // Positional steering vectors for the designed positions.
+    if name == "decoder.positional_embedding" {
+        let n_state = shape[0];
+        let pos = index / n_state;
+        let dim = index % n_state;
+        if let Some(target_dim) = designed_pos_dim(pos) {
+            return Some(if dim == target_dim {
+                DESIGN_POS_SCALE
+            } else {
+                0.0
+            });
+        }
+        return None;
+    }
+    None
+}
+
+/// Value written for a single tensor element: the designed override if present,
+/// otherwise the default deterministic pseudo-random value.
+fn tensor_element_value(name: &str, name_hash: u64, index: usize, shape: &[usize]) -> f32 {
+    design_override(name, index, shape).unwrap_or_else(|| deterministic_value(name_hash, index))
+}
+
+/// Text for a vocabulary entry. Designed text tokens carry real words so the
+/// decoded transcript is non-empty; every other id is a self-describing
+/// placeholder that [`crate::tokenizer::decode`] elides as a special token.
+fn designed_vocab_text(i: usize) -> String {
+    match i as u32 {
+        TOK_HELLO => "hello".to_string(),
+        TOK_WORLD => " world".to_string(),
+        _ => format!("<|{i}|>"),
+    }
+}
+
 /// Produce a deterministic value in `[-0.01, 0.01]` from a name hash and index.
 fn deterministic_value(name_hash: u64, index: usize) -> f32 {
     let mixed = name_hash
@@ -557,4 +740,236 @@ fn simple_hash(s: &str) -> u64 {
         h = h.wrapping_mul(1099511628211);
     }
     h
+}
+
+// ── Multi-speaker diarization fixtures ────────────────────────────────────────
+//
+// A deterministic multi-speaker AUDIO mixer plus its exact ground-truth RTTM,
+// for the diarization evaluation tests (Batch F2). Everything here is a pure,
+// closed-form function of the arguments — no randomness, no clock — so the
+// generated waveform and reference are byte-for-byte reproducible.
+
+/// Number of round-robin rounds produced by [`synthetic_multispeaker`]: every
+/// speaker takes exactly this many turns, so the mixture contains
+/// `num_speakers * MULTISPEAKER_ROUNDS` turns in speaker order
+/// `0, 1, …, k-1, 0, 1, …`.
+#[cfg(feature = "diarization")]
+const MULTISPEAKER_ROUNDS: usize = 2;
+
+/// One sample of speaker `speaker`'s *phonation-style* voice at time `t_sec`.
+///
+/// This is **not** real speech: it is a deterministic voiced-vowel proxy — a
+/// glottal fundamental `f0` plus three formant sinusoids, all at
+/// speaker-dependent frequencies. Because each speaker owns a distinct
+/// `(f0, F1, F2, F3)` tuple, two speakers occupy visibly different spectral
+/// bands, so their log-mel spectrograms (and hence any content- or
+/// speaker-discriminative embedding) differ. The amplitudes are fixed so the
+/// waveform RMS sits far above the VAD energy threshold (a turn is always
+/// detected as speech).
+#[cfg(feature = "diarization")]
+fn speaker_voice_sample(speaker: usize, t_sec: f32) -> f32 {
+    let k = speaker as f32;
+    // Distinct fundamental per speaker (≈110 Hz, +35 Hz per speaker index).
+    let f0 = 110.0 + 35.0 * k;
+    // Three formant resonances, each shifted per speaker so the spectral
+    // envelope — not just the pitch — is speaker-specific.
+    let formants = [520.0 + 130.0 * k, 1500.0 + 260.0 * k, 2600.0 + 320.0 * k];
+    let formant_amps = [0.32f32, 0.20, 0.12];
+
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let mut s = 0.55 * (two_pi * f0 * t_sec).sin();
+    for (&freq, &amp) in formants.iter().zip(formant_amps.iter()) {
+        s += amp * (two_pi * freq * t_sec).sin();
+    }
+    // Peak |s| ≤ 1.19, scaled to ≤ ~0.6 so the signal stays well inside [-1, 1]
+    // while its RMS (~0.25) dominates the default 0.01 VAD energy threshold.
+    0.5 * s
+}
+
+/// Build a deterministic multi-speaker "conversation" and its exact
+/// ground-truth RTTM turns.
+///
+/// The waveform is `num_speakers * MULTISPEAKER_ROUNDS` back-to-back turns of
+/// `turn_seconds` each, cycling through the speakers in round-robin order. Turn
+/// `i` is spoken by speaker `i % num_speakers` using a distinct voiced profile
+/// (a glottal fundamental plus three formant sinusoids at speaker-dependent
+/// frequencies), and there is **no** silence between turns — the only acoustic
+/// event at a turn boundary is the speaker (spectral-content) change, which is
+/// exactly what a diarizer must detect.
+///
+/// Returns `(audio, reference)` where:
+/// * `audio` is mono `f32` PCM at `sample_rate` Hz, length
+///   `num_speakers * MULTISPEAKER_ROUNDS * round(turn_seconds * sample_rate)`;
+/// * `reference` is the exact ground truth as a `Vec` of
+///   [`RttmSegment`](crate::diarize::metrics::RttmSegment), one entry per turn,
+///   with speaker name `"speaker_{k}"` and `start`/`end` derived from the turn's
+///   **sample** boundaries (so the RTTM times line up bit-for-bit with the audio
+///   rather than accumulating `f32` rounding drift).
+///
+/// # Honesty note (this is a proxy, not speech)
+///
+/// Each "speaker" here is a fixed sum of sinusoids, so the speaker identity is
+/// carried entirely by raw spectral content. A low DER against this fixture
+/// therefore does **not** demonstrate real speaker-embedding quality — even a
+/// speaker-*invariant* content encoder can separate pure tones at different
+/// frequencies. Genuine speaker-discrimination validation needs a pretrained
+/// ECAPA-TDNN / x-vector checkpoint and a labelled speech corpus, which is out
+/// of scope for this in-crate fixture (see the Batch F2 note in
+/// `tests/diarization_synthetic.rs`).
+///
+/// Degenerate arguments (`num_speakers == 0`, `sample_rate == 0`, or a
+/// `turn_seconds` that rounds to zero samples) yield an empty waveform and empty
+/// reference rather than panicking.
+#[cfg(feature = "diarization")]
+pub fn synthetic_multispeaker(
+    num_speakers: usize,
+    turn_seconds: f32,
+    sample_rate: usize,
+) -> (Vec<f32>, Vec<crate::diarize::metrics::RttmSegment>) {
+    use crate::diarize::metrics::RttmSegment;
+
+    if num_speakers == 0 || sample_rate == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let turn_samples = (turn_seconds * sample_rate as f32).round() as usize;
+    if turn_samples == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let total_turns = num_speakers * MULTISPEAKER_ROUNDS;
+    let mut audio = Vec::with_capacity(turn_samples * total_turns);
+    let mut reference = Vec::with_capacity(total_turns);
+
+    for turn in 0..total_turns {
+        let speaker = turn % num_speakers;
+        let turn_start = turn * turn_samples;
+        for i in 0..turn_samples {
+            let global = turn_start + i;
+            let t_sec = global as f32 / sample_rate as f32;
+            audio.push(speaker_voice_sample(speaker, t_sec));
+        }
+        // Times are taken from the sample-index boundaries so RTTM and audio
+        // agree exactly (no drift from re-multiplying turn_seconds in f32).
+        reference.push(RttmSegment {
+            speaker: format!("speaker_{speaker}"),
+            start: turn_start as f32 / sample_rate as f32,
+            end: (turn_start + turn_samples) as f32 / sample_rate as f32,
+        });
+    }
+
+    (audio, reference)
+}
+
+#[cfg(all(test, feature = "diarization"))]
+mod multispeaker_tests {
+    use super::*;
+
+    /// Root-mean-square energy of a slice, in the same units the VAD uses.
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sum_sq: f64 = samples.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        (sum_sq / samples.len() as f64).sqrt() as f32
+    }
+
+    #[test]
+    fn test_multispeaker_layout_and_ground_truth_are_exact() {
+        let sr = 16_000usize;
+        let turn_seconds = 2.0f32;
+        let (audio, reference) = synthetic_multispeaker(2, turn_seconds, sr);
+
+        // 2 speakers × MULTISPEAKER_ROUNDS(=2) round-robin turns.
+        let turn_samples = (turn_seconds * sr as f32).round() as usize;
+        assert_eq!(turn_samples, 32_000, "1 turn = 2.0s @ 16 kHz");
+        assert_eq!(reference.len(), 2 * MULTISPEAKER_ROUNDS);
+        assert_eq!(
+            audio.len(),
+            turn_samples * 2 * MULTISPEAKER_ROUNDS,
+            "audio length must be exactly total_turns × turn_samples"
+        );
+
+        // Round-robin speaker order and sample-aligned boundaries.
+        let expected_speakers = ["speaker_0", "speaker_1", "speaker_0", "speaker_1"];
+        for (i, seg) in reference.iter().enumerate() {
+            assert_eq!(seg.speaker, expected_speakers[i], "turn {i} speaker");
+            let start = (i * turn_samples) as f32 / sr as f32;
+            let end = ((i + 1) * turn_samples) as f32 / sr as f32;
+            assert_eq!(seg.start, start, "turn {i} start is sample-aligned");
+            assert_eq!(seg.end, end, "turn {i} end is sample-aligned");
+        }
+        // Contiguous, gap-free timeline (each turn begins where the last ended).
+        for pair in reference.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "turns must be back-to-back");
+        }
+    }
+
+    #[test]
+    fn test_multispeaker_turns_are_audible_and_speaker_distinct() {
+        let sr = 16_000usize;
+        let (audio, reference) = synthetic_multispeaker(2, 2.0, sr);
+        let turn_samples = (2.0f32 * sr as f32).round() as usize;
+
+        // Every turn's RMS clears the default VAD energy threshold (0.01) by a
+        // wide margin, so the whole mixture is detected as speech.
+        for i in 0..reference.len() {
+            let start = i * turn_samples;
+            let block = &audio[start..start + turn_samples];
+            assert!(
+                rms(block) > 0.05,
+                "turn {i} RMS {} must clear the VAD threshold",
+                rms(block)
+            );
+        }
+
+        // The two speakers must actually differ acoustically: the sample blocks
+        // of speaker_0 (turn 0) and speaker_1 (turn 1) are not equal, and their
+        // per-block mean-absolute difference is non-trivial.
+        let s0 = &audio[0..turn_samples];
+        let s1 = &audio[turn_samples..2 * turn_samples];
+        let mean_abs_diff: f64 = s0
+            .iter()
+            .zip(s1.iter())
+            .map(|(&a, &b)| (a - b).abs() as f64)
+            .sum::<f64>()
+            / turn_samples as f64;
+        assert!(
+            mean_abs_diff > 0.1,
+            "distinct speaker profiles must produce distinct waveforms, got {mean_abs_diff}"
+        );
+    }
+
+    #[test]
+    fn test_multispeaker_three_speakers_round_robin() {
+        let sr = 16_000usize;
+        let (_audio, reference) = synthetic_multispeaker(3, 1.5, sr);
+        assert_eq!(reference.len(), 3 * MULTISPEAKER_ROUNDS);
+        let names: Vec<&str> = reference.iter().map(|s| s.speaker.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "speaker_0",
+                "speaker_1",
+                "speaker_2",
+                "speaker_0",
+                "speaker_1",
+                "speaker_2",
+            ],
+            "3 speakers must cycle in round-robin order across rounds"
+        );
+    }
+
+    #[test]
+    fn test_multispeaker_degenerate_args_yield_empty() {
+        assert_eq!(
+            synthetic_multispeaker(0, 1.0, 16_000),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(synthetic_multispeaker(2, 1.0, 0), (Vec::new(), Vec::new()));
+        // turn_seconds that rounds to zero samples.
+        assert_eq!(
+            synthetic_multispeaker(2, 0.000_01, 16_000),
+            (Vec::new(), Vec::new())
+        );
+    }
 }

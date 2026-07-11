@@ -187,7 +187,11 @@ pub(crate) fn align_offset(offset: u64, alignment: u64) -> u64 {
     if remainder == 0 {
         offset
     } else {
-        offset + (alignment - remainder)
+        // `alignment - remainder` cannot underflow (remainder < alignment).
+        // Saturate on the outer add so an adversarial `general.alignment`
+        // near `u64::MAX` cannot panic on overflow; a saturated base simply
+        // seeks past EOF and is rejected downstream when tensor data is read.
+        offset.saturating_add(alignment - remainder)
     }
 }
 
@@ -205,8 +209,16 @@ pub(crate) struct TensorInfo {
 
 impl TensorInfo {
     /// Total number of logical elements (product of all dimensions).
-    pub(crate) fn n_elements(&self) -> u64 {
-        self.dims.iter().product()
+    ///
+    /// Returns `None` if the product overflows `u64`. A plain `.product()`
+    /// would silently wrap in release builds (yielding a bogus, often small,
+    /// element count) and *panic* in overflow-checked builds — both are
+    /// unacceptable for an attacker-controlled tensor descriptor, so the
+    /// multiplication is performed with `checked_mul`.
+    pub(crate) fn n_elements(&self) -> Option<u64> {
+        self.dims
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
     }
 }
 

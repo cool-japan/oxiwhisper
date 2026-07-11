@@ -1326,3 +1326,162 @@ mod tests {
         assert!(result.is_err(), "truncated high surrogate must be rejected");
     }
 }
+
+/// Property-based hardening tests for [`parse_json_string`], the hand-written
+/// JSON string unescaper (including `\uXXXX` and UTF-16 surrogate pairs) that
+/// consumes attacker-controlled tokenizer JSON.
+#[cfg(test)]
+mod json_proptest {
+    use super::parse_json_string;
+    use proptest::prelude::*;
+
+    /// Serialise `s` into a JSON string literal (`"..."`) using only escapes
+    /// that [`parse_json_string`] understands, so parsing it back must reproduce
+    /// `s` exactly. Control characters use `\uXXXX` (the parser does not accept
+    /// `\b` / `\f`); all other scalars — including multibyte and supplementary
+    /// UTF-8 — are emitted raw.
+    fn escape_json(s: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len() + 2);
+        out.push(b'"');
+        for ch in s.chars() {
+            match ch {
+                '"' => out.extend_from_slice(b"\\\""),
+                '\\' => out.extend_from_slice(b"\\\\"),
+                '\n' => out.extend_from_slice(b"\\n"),
+                '\r' => out.extend_from_slice(b"\\r"),
+                '\t' => out.extend_from_slice(b"\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes());
+                }
+                c => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        out.push(b'"');
+        out
+    }
+
+    /// Split a supplementary (non-BMP) code point into its UTF-16 surrogate
+    /// pair `(high, low)`.
+    fn to_surrogate_pair(cp: u32) -> (u32, u32) {
+        debug_assert!(cp >= 0x10000);
+        let c = cp - 0x10000;
+        (0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF))
+    }
+
+    #[test]
+    fn supplementary_plane_literals_survive() {
+        // Both the raw-byte path and the surrogate-pair-escape path must
+        // reproduce these non-BMP characters.
+        for &ch in &['😀', '𝐀', '𠀀'] {
+            let s = ch.to_string();
+
+            // Raw path.
+            let raw = escape_json(&s);
+            let (parsed, pos) = parse_json_string(&raw, 0).expect("raw non-BMP must parse");
+            assert_eq!(parsed, s, "raw round-trip failed for U+{:X}", ch as u32);
+            assert_eq!(pos, raw.len());
+
+            // Surrogate-pair-escape path.
+            let (hi, lo) = to_surrogate_pair(ch as u32);
+            let escaped = format!("\"\\u{hi:04x}\\u{lo:04x}\"");
+            let (parsed2, _) =
+                parse_json_string(escaped.as_bytes(), 0).expect("surrogate pair must parse");
+            assert_eq!(
+                parsed2, s,
+                "surrogate round-trip failed for U+{:X}",
+                ch as u32
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Round-trip: any Rust `String`, serialised via [`escape_json`] and
+        /// parsed back, must equal the original and consume the whole literal.
+        #[test]
+        fn round_trip_arbitrary_string(
+            chars in proptest::collection::vec(any::<char>(), 0..48),
+        ) {
+            let s: String = chars.into_iter().collect();
+            let bytes = escape_json(&s);
+            let (parsed, pos) = parse_json_string(&bytes, 0)
+                .map_err(|e| TestCaseError::fail(format!("unexpected Err: {e}")))?;
+            prop_assert_eq!(parsed, s);
+            prop_assert_eq!(pos, bytes.len());
+        }
+
+        /// A BMP scalar escaped as `\uXXXX` must decode back to that scalar.
+        #[test]
+        fn bmp_unicode_escape_round_trips(cp in 0x0000u32..=0xFFFFu32) {
+            // Skip surrogate code points — they are not scalar values.
+            prop_assume!(!(0xD800..=0xDFFF).contains(&cp));
+            let expected = char::from_u32(cp).expect("valid BMP scalar");
+            let literal = format!("\"\\u{cp:04x}\"");
+            let (parsed, _) = parse_json_string(literal.as_bytes(), 0)
+                .map_err(|e| TestCaseError::fail(format!("unexpected Err: {e}")))?;
+            prop_assert_eq!(parsed, expected.to_string());
+        }
+
+        /// A supplementary scalar escaped as a `\uHIGH\uLOW` surrogate pair must
+        /// decode back to that scalar.
+        #[test]
+        fn supplementary_surrogate_pair_round_trips(cp in 0x10000u32..=0x10FFFFu32) {
+            let expected = char::from_u32(cp).expect("valid supplementary scalar");
+            let (hi, lo) = to_surrogate_pair(cp);
+            let literal = format!("\"\\u{hi:04x}\\u{lo:04x}\"");
+            let (parsed, _) = parse_json_string(literal.as_bytes(), 0)
+                .map_err(|e| TestCaseError::fail(format!("unexpected Err: {e}")))?;
+            prop_assert_eq!(parsed, expected.to_string());
+        }
+
+        /// Arbitrary escape "soup" drawn from an escape-flavoured alphabet must
+        /// never panic; the parser always terminates (each step advances) and
+        /// returns `Ok` or `Err`.
+        #[test]
+        fn escape_soup_never_panics(
+            soup in proptest::collection::vec(
+                prop::sample::select(
+                    b"\\u\"/nrtbfxdD0189abcdefABCDEF{} ".to_vec(),
+                ),
+                0..64,
+            ),
+        ) {
+            let mut bytes = Vec::with_capacity(soup.len() + 1);
+            bytes.push(b'"');
+            bytes.extend_from_slice(&soup);
+            let _ = parse_json_string(&bytes, 0);
+        }
+
+        /// A lone high surrogate (not followed by a valid low surrogate) must be
+        /// rejected, never silently dropped (regression guard for BUG1).
+        #[test]
+        fn lone_high_surrogate_is_err(high in 0xD800u32..=0xDBFFu32) {
+            // No following `\u`: high surrogate then immediate closing quote.
+            let literal = format!("\"\\u{high:04x}\"");
+            prop_assert!(parse_json_string(literal.as_bytes(), 0).is_err());
+        }
+
+        /// A high surrogate followed by a `\u` that is not a low surrogate must
+        /// also be rejected.
+        #[test]
+        fn high_surrogate_bad_low_is_err(
+            high in 0xD800u32..=0xDBFFu32,
+            // Any code unit outside the low-surrogate range.
+            bad_low in prop_oneof![0x0000u32..=0xDBFFu32, 0xE000u32..=0xFFFFu32],
+        ) {
+            let literal = format!("\"\\u{high:04x}\\u{bad_low:04x}\"");
+            prop_assert!(parse_json_string(literal.as_bytes(), 0).is_err());
+        }
+
+        /// A lone low surrogate must be rejected.
+        #[test]
+        fn lone_low_surrogate_is_err(low in 0xDC00u32..=0xDFFFu32) {
+            let literal = format!("\"\\u{low:04x}\"");
+            prop_assert!(parse_json_string(literal.as_bytes(), 0).is_err());
+        }
+    }
+}

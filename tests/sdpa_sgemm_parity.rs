@@ -1,9 +1,18 @@
-//! Parity tests: verify SDPA sgemm path produces stable deterministic output.
+//! Determinism regression tests for the full `transcribe` pipeline.
 //!
-//! These tests run the full transcribe pipeline and assert bit-exact
-//! determinism across repeated runs of the same input.  They capture the
-//! baseline behaviour before and after the G1 sgemm refactor so any
-//! numerical regression is caught immediately.
+//! These tests run `transcribe` twice on identical input and assert the
+//! results are bit-exact equal. That verifies run-to-run determinism (e.g.
+//! no clobbering of shared scratch buffers across calls) for the sgemm-based
+//! SDPA path introduced by the G1 refactor. It does **not** verify numerical
+//! correctness against a reference implementation — two runs of the same
+//! (possibly wrong) computation would still agree with each other.
+//!
+//! Unit-level parity between a naive scalar attention reference and the real
+//! sgemm-based SDPA implementation lives in `src/decoder/sdpa_tests.rs` as
+//! inline `#[cfg(test)]` tests that call the actual `oxiwhisper` functions.
+//! It cannot live here: every SDPA symbol in `src/decoder/sdpa.rs` is
+//! `pub(crate)`, so it is unreachable from an integration test binary such
+//! as this one.
 //!
 //! Model generation is inlined here because `test_utils` is only exposed
 //! under `#[cfg(test)]` and therefore not accessible from integration tests.
@@ -240,8 +249,13 @@ fn generate_model() -> PathBuf {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+/// Two `transcribe` calls on identical silent input, through a model loaded
+/// once, must produce bit-exact identical output. This guards against
+/// nondeterminism introduced by the sgemm-based SDPA path (e.g. leftover
+/// state in reused scratch buffers) — it does not check the output against
+/// any reference transcription.
 #[test]
-fn test_transcribe_parity_baseline() {
+fn test_transcribe_silence_is_deterministic() {
     use oxiwhisper::{TranscribeOptions, WhisperModel};
 
     let path = generate_model();
@@ -264,8 +278,12 @@ fn test_transcribe_parity_baseline() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Same determinism check as [`test_transcribe_silence_is_deterministic`],
+/// but on a non-silent (sine wave) input so the SDPA attention weights are
+/// non-degenerate across the full sequence rather than collapsing on
+/// all-zero audio.
 #[test]
-fn test_transcribe_with_sine_parity() {
+fn test_transcribe_sine_is_deterministic() {
     use oxiwhisper::{TranscribeOptions, WhisperModel};
 
     let path = generate_model();
@@ -292,157 +310,4 @@ fn test_transcribe_with_sine_parity() {
     );
 
     let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn test_sdpa_unit_sgemm_correctness() {
-    // Unit test: compare scalar SDPA against sgemm-based path directly,
-    // using known Q/K/V data and comparing outputs numerically.
-    //
-    // Q: [n_head=2, q_len=3, head_dim=4]
-    // K: [n_head=2, kv_len=5, head_dim=4]  (full attention, no mask)
-    // V: [n_head=2, kv_len=5, head_dim=4]
-
-    let n_head = 2usize;
-    let q_len = 3usize;
-    let kv_len = 5usize;
-    let head_dim = 4usize;
-    let scale = (head_dim as f32).sqrt().recip();
-
-    // Deterministic Q, K, V in [n_head, seq, head_dim] layout
-    let q: Vec<f32> = (0..(n_head * q_len * head_dim))
-        .map(|i| (i as f32 + 1.0) * 0.05)
-        .collect();
-    let k: Vec<f32> = (0..(n_head * kv_len * head_dim))
-        .map(|i| (i as f32 + 1.0) * 0.03)
-        .collect();
-    let v: Vec<f32> = (0..(n_head * kv_len * head_dim))
-        .map(|i| (i as f32 + 1.0) * 0.02)
-        .collect();
-
-    // --- Scalar reference ---
-    let n_state = n_head * head_dim;
-    let mut scalar_out = vec![0.0f32; q_len * n_state];
-    for h in 0..n_head {
-        let q_off = h * q_len * head_dim;
-        let k_off = h * kv_len * head_dim;
-        let v_off = h * kv_len * head_dim;
-
-        let mut scores = vec![0.0f32; q_len * kv_len];
-        for i in 0..q_len {
-            for j in 0..kv_len {
-                let mut s = 0.0f32;
-                for d in 0..head_dim {
-                    s += q[q_off + i * head_dim + d] * k[k_off + j * head_dim + d];
-                }
-                scores[i * kv_len + j] = s * scale;
-            }
-        }
-        // Row softmax
-        for i in 0..q_len {
-            let row = &mut scores[i * kv_len..(i + 1) * kv_len];
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for x in row.iter_mut() {
-                *x = (*x - max).exp();
-                sum += *x;
-            }
-            if sum > 0.0 {
-                let inv = sum.recip();
-                for x in row.iter_mut() {
-                    *x *= inv;
-                }
-            }
-        }
-        // Accumulate: scores @ V
-        for i in 0..q_len {
-            for j in 0..kv_len {
-                let s = scores[i * kv_len + j];
-                for d in 0..head_dim {
-                    scalar_out[i * n_state + h * head_dim + d] += s * v[v_off + j * head_dim + d];
-                }
-            }
-        }
-    }
-
-    // --- sgemm path ---
-    let mut sgemm_scores = vec![0.0f32; n_head * q_len * kv_len];
-    for h in 0..n_head {
-        let q_ptr = q[h * q_len * head_dim..].as_ptr();
-        let k_ptr = k[h * kv_len * head_dim..].as_ptr();
-        let s_ptr = sgemm_scores[h * q_len * kv_len..].as_mut_ptr();
-        // Q @ K^T: Q is [q_len, head_dim], K is [kv_len, head_dim] so K^T has strides (1, head_dim)
-        unsafe {
-            matrixmultiply::sgemm(
-                q_len,
-                head_dim,
-                kv_len,
-                scale,
-                q_ptr,
-                head_dim as isize,
-                1,
-                k_ptr,
-                1,
-                head_dim as isize,
-                0.0,
-                s_ptr,
-                kv_len as isize,
-                1,
-            );
-        }
-    }
-    // Row softmax
-    for h in 0..n_head {
-        for i in 0..q_len {
-            let off = h * q_len * kv_len + i * kv_len;
-            let row = &mut sgemm_scores[off..off + kv_len];
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for x in row.iter_mut() {
-                *x = (*x - max).exp();
-                sum += *x;
-            }
-            if sum > 0.0 {
-                let inv = sum.recip();
-                for x in row.iter_mut() {
-                    *x *= inv;
-                }
-            }
-        }
-    }
-    // scores @ V via sgemm, writing into [q_len, n_state] interleaved output
-    let mut sgemm_out = vec![0.0f32; q_len * n_state];
-    for h in 0..n_head {
-        let s_ptr = sgemm_scores[h * q_len * kv_len..].as_ptr();
-        let v_ptr = v[h * kv_len * head_dim..].as_ptr();
-        // Write into sgemm_out[i*n_state + h*head_dim .. +head_dim]
-        // Row stride for output = n_state, col stride = 1
-        let o_ptr = unsafe { sgemm_out.as_mut_ptr().add(h * head_dim) };
-        unsafe {
-            matrixmultiply::sgemm(
-                q_len,
-                kv_len,
-                head_dim,
-                1.0,
-                s_ptr,
-                kv_len as isize,
-                1,
-                v_ptr,
-                head_dim as isize,
-                1,
-                0.0,
-                o_ptr,
-                n_state as isize,
-                1,
-            );
-        }
-    }
-
-    // Compare
-    for (i, (&sc, &sg)) in scalar_out.iter().zip(sgemm_out.iter()).enumerate() {
-        assert!(
-            (sc - sg).abs() < 1e-5,
-            "SDPA scalar vs sgemm mismatch at index {i}: scalar={sc}, sgemm={sg}"
-        );
-    }
 }

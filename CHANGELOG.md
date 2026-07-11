@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-07-11
+
+### Added
+- **Speaker diarization** (new `diarization` feature, off by default): answers *who spoke when* via `WhisperModel::diarize` / `diarize_with_embedder`, and *who spoke what* via `WhisperModel::transcribe_with_speakers` / `transcribe_with_speakers_using_embedder`. Offline embedding-clustering pipeline: energy VAD -> uniform sub-segmentation -> per-window speaker embedding -> cosine-affinity clustering (agglomerative or spectral, with speaker-count estimation) -> resegmentation -> fusion with word timestamps. `SpeakerEmbedder` trait with two backends: `WhisperEncoderEmbedder` (baseline) and `EcapaOnnx` (ECAPA-TDNN / x-vector via `oxionnx`, behind the `onnx` feature, user-supplied checkpoint). NIST **RTTM** export (`write_rttm`, `rttm_string`) and `[SPEAKER_k]`-labeled transcripts; **DER/JER** evaluation with Hungarian speaker mapping (`der`, `jer`, `parse_rttm`); `examples/diarize.rs` CLI. Clustering and the symmetric eigensolver are implemented **inline** (no `ndarray`/`nalgebra`). **Honest limitation:** the built-in `WhisperEncoderEmbedder` is a low-accuracy baseline — Whisper's encoder is trained to be speaker-*invariant* — provided for tests and no-model demos only; production accuracy requires an external pretrained ECAPA-TDNN / x-vector ONNX model, and overlapped speech is attributed to a single speaker.
+- **Word-level timestamps** (`WhisperModel::transcribe_words`, `WordTimedTranscript`,
+  `WordSegment`): set `word_timestamps: true` on `TranscribeOptions` (or call
+  `transcribe_words`) to receive per-word start/end times aligned via cross-attention DTW;
+  the existing fully-tested `dtw.rs` (`align_tokens_dp_dtw`, `build_word_segments`) is now
+  wired into the public API; greedy and temperature-sampling paths supported; beam search
+  (`beam_width > 1`) returns `ConfigError`
+- **`TranscribeOptions::word_timestamps`** (default `false`) — opt-in flag; zero overhead when
+  disabled (no cross-attention buffers allocated)
+- **`TranscribeOptions::no_speech_threshold`** (default `0.6`) — combined OpenAI-style silence
+  gate: if `no_speech_prob > no_speech_threshold` AND `avg_logprob < logprob_threshold`, the
+  segment is returned empty (silence detected); `no_speech_prob` now captured from the raw
+  prefill logits (before any suppression) for all three samplers
+- **`TranscribeOptions::suppress_blank`** (default `true`) — suppress the leading-space "blank"
+  token and EOT at decode step 0 (matches OpenAI's `SuppressBlank`); prevents transcripts from
+  opening with whitespace or terminating immediately
+- **`ApplyTimestampRules`** applied automatically when `timestamps == true`: (a) suppress
+  `<|notimestamps|>` always; (b) force text after a complete timestamp pair, force another
+  timestamp after a lone one, monotonic floor; (c) force timestamp when timestamp probability
+  mass dominates best text token — full OpenAI parity, applied inside all three samplers
+- **`DecodeResult::cross_attention`** — flat `[n_tokens * enc_len]` head- and layer-averaged
+  cross-attention matrix; `None` by default (zero overhead when not capturing)
+- **`DecodeResult::enc_len`** — encoder frame count (required for DTW)
+- **`DecodeResult::no_speech_prob`** — `<|nospeech|>` probability at the first decoded position
+- **Translation task** (`Task { Transcribe, Translate }` enum + `TranscribeOptions::task` field):
+  set `task: Task::Translate` to decode any-language audio into English via the Whisper
+  `<|translate|>` (50358) token; default `Task::Transcribe` is a no-op for existing callers
+- **Temperature fallback decoding** (`fallback_temperatures: &[f32]` + `logprob_threshold: f32`
+  fields on `TranscribeOptions`): OpenAI-style robustness — when a decode attempt has low average
+  log-probability or degenerate char-entropy, the decoder retries at the next temperature in the
+  schedule; the first acceptable result is returned, or the last attempt if none qualify; an empty
+  schedule (default) preserves the existing single-dispatch behaviour with zero overhead
+- **Progress callbacks** for long-audio transcription:
+  `transcribe_long_with_progress`, `transcribe_long_segmented_with_progress`, and
+  `transcribe_long_with_vad_with_progress` each accept `FnMut(chunk_index: usize, total: usize)`;
+  the original methods now delegate via a no-op closure, preserving their signatures
+
+### Changed
+- **Symphonia 0.6 API migration**: updated `decode_with_symphonia` in `src/audio.rs` to the
+  Symphonia 0.6 API; `SampleBuffer` replaced by `GenericAudioBufferRef::copy_to_vec_interleaved`,
+  `CODEC_TYPE_NULL`/`DecoderOptions` replaced by `CodecParameters::Audio`/`AudioDecoderOptions`,
+  `Probe::format()` replaced by `Probe::probe()`, `CodecRegistry::make()` replaced by
+  `make_audio_decoder()`, `Hint` import path corrected to `formats::probe::Hint`, and
+  `next_packet()` now handles `Ok(None)` for end-of-stream; zero API changes for callers
+- **Behavior change (OpenAI parity defaults ON)**: `suppress_blank=true` and
+  `no_speech_threshold=0.6` are active by default. Existing callers that previously relied on
+  the leading-space token or EOT being selectable at step 0 should set `suppress_blank=false`.
+  The `ApplyTimestampRules` filter is applied whenever `timestamps=true` (no opt-out needed —
+  it only activates timestamp-related invariants and has no effect when timestamps are disabled)
+- **Sampler return arity**: `decode_greedy`, `decode_sample`, `decode_beam` now return
+  `(tokens, probs, no_speech_prob)` 3-tuple (internal API only; no public API change)
+- **Removed crude no-speech checks**: the argmax-equals-no_speech early-return in greedy and
+  beam was deleted in favour of the proper `no_speech_prob` gate applied post-decode
+
+### Fixed
+- **Beam search decoding (`beam_width > 1`) could return an empty transcription for audible
+  speech** when timestamps were enabled: if a stop/EOT token appeared among the top-k seed
+  candidates, it was seeded as an already-`done` beam with zero tokens, and that beam's
+  normalized score (`score / 1`) could unfairly outscore every real hypothesis in the final beam
+  comparison, producing empty output for audible input. Seeding now over-samples the top-k
+  candidates and filters out stop tokens before seeding, falling back to empty output only when
+  every top candidate is genuinely a stop token (true silence); pinned by a new regression test
+  (`src/beam_search.rs`, `decode_beam`)
+- **Malformed or truncated GGUF model files could panic (integer overflow) or attempt an
+  unbounded allocation** instead of failing cleanly: tensor element counts and byte sizes are now
+  computed with checked arithmetic, and each tensor's declared data range is validated against
+  the actual file length before its buffer is allocated, so a corrupted or adversarially-crafted
+  `.gguf` file is now rejected with `OxiWhisperError::InvalidModel` instead of crashing or
+  attempting a multi-gigabyte allocation; an out-of-range `general.alignment` value no longer
+  panics either (`src/gguf/parse.rs`, `src/gguf/spec.rs`)
+
 ## [0.1.1] - 2026-04-26
 
 ### Added

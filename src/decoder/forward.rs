@@ -1,5 +1,6 @@
 //! Decoder forward pass, prompt construction, and the top-level `decode` entry point.
 
+use super::cross_attn_capture::{CrossAttnCapture, is_alignment_layer};
 use super::kv_cache::LayerKVCache;
 use super::sampler::{decode_greedy, decode_sample};
 use super::sdpa::{
@@ -8,10 +9,12 @@ use super::sdpa::{
 
 use crate::beam_search::decode_beam;
 use crate::decode_utils::{DecodeArgs, DecodeConstraints};
+use crate::hallucination::is_likely_hallucination;
 use crate::linear;
 use crate::model::ModelData;
 use crate::tensor::Tensor;
-use crate::tokenizer::SpecialTokens;
+use crate::tokenizer::{self, SpecialTokens};
+use crate::types::Task;
 
 /// Maximum number of tokens the decoder will generate per segment.
 pub(crate) const MAX_DECODE_LENGTH: usize = 224;
@@ -55,6 +58,16 @@ pub struct DecodeResult {
     /// Detected language code (e.g. `"en"`, `"ja"`), or `None` if language was
     /// explicitly specified via options.
     pub detected_language: Option<String>,
+    /// Head- and layer-averaged cross-attention matrix, flat `[tokens.len() * enc_len]`
+    /// row-major.  `None` unless
+    /// [`TranscribeOptions::word_timestamps`](crate::TranscribeOptions::word_timestamps)
+    /// was enabled and `beam_width == 1`.
+    pub cross_attention: Option<Vec<f32>>,
+    /// Encoder frame count (== `n_frames` for DTW).  `0` when `cross_attention` is `None`.
+    pub enc_len: usize,
+    /// Probability of the `<|nospeech|>` token at the first decoded position
+    /// (softmax over the prefill logits, before any suppression).  In `[0, 1]`.
+    pub no_speech_prob: f32,
 }
 
 /// Run the Whisper text decoder with KV cache for efficient autoregressive decoding.
@@ -131,12 +144,28 @@ pub fn decode(
         combined.append(&mut all_initial);
         all_initial = combined;
     }
-    let prompt = build_prompt(&special, lang_token, opts.timestamps, &all_initial);
+    let task_token = match opts.task {
+        Task::Transcribe => special.transcribe,
+        Task::Translate => special.translate,
+    };
+    let prompt = build_prompt(
+        &special,
+        lang_token,
+        task_token,
+        opts.timestamps,
+        &all_initial,
+    );
     let kv_capacity = prompt.len() + MAX_DECODE_LENGTH + 4;
+
+    // Blank token for suppress_blank: greedy longest-match of " " against vocab.
+    let blank_token: Option<u32> = encode_prompt_text(" ", &model.vocab).first().copied();
 
     let constraints = DecodeConstraints {
         suppress: opts.suppress_tokens.unwrap_or(&[]),
         no_repeat_ngram_size: opts.no_repeat_ngram_size,
+        timestamp_rules: opts.timestamps,
+        suppress_blank: opts.suppress_blank,
+        blank_token,
     };
     let args = DecodeArgs {
         kv_capacity,
@@ -146,18 +175,118 @@ pub fn decode(
         dtype: opts.kv_cache_dtype,
     };
 
-    let (tokens, token_probs) = if opts.temperature > 0.0 {
-        decode_sample(&prompt, &ctx, &args, opts)?
-    } else if opts.beam_width <= 1 {
-        decode_greedy(&prompt, &ctx, &args)?
+    // Whether to capture cross-attention for word timestamps (greedy/sample only).
+    let capturing = opts.word_timestamps && opts.beam_width <= 1;
+
+    // Accumulates attention rows from the accepted decode attempt.
+    // One row per accepted output token, each of length `enc_len`.
+    let mut last_attn: Vec<f32> = if capturing {
+        Vec::with_capacity(MAX_DECODE_LENGTH * enc_len)
     } else {
-        decode_beam(&prompt, &ctx, &args, opts.beam_width)?
+        Vec::new()
+    };
+
+    // Dispatch closure: selects the sampler by temperature; t > 0 uses sample,
+    // t == 0 uses beam or greedy. The strict > guard is load-bearing — decode_sample
+    // divides by temperature and must never be called with t == 0.
+    // Returns (tokens, token_probs, no_speech_prob).
+    // Also clears and refills `last_attn` on each call (for retry correctness).
+    let (tokens, token_probs, no_speech_prob) = {
+        let mut decode_at = |t: f32| -> Result<(Vec<u32>, Vec<f32>, f32), String> {
+            last_attn.clear();
+            let attn_opt: Option<&mut Vec<f32>> = if capturing {
+                Some(&mut last_attn)
+            } else {
+                None
+            };
+            if t > 0.0 {
+                let mut o = opts.clone();
+                o.temperature = t;
+                decode_sample(&prompt, &ctx, &args, &o, attn_opt)
+            } else if opts.beam_width > 1 {
+                decode_beam(&prompt, &ctx, &args, opts.beam_width)
+            } else {
+                decode_greedy(&prompt, &ctx, &args, attn_opt)
+            }
+        };
+
+        if opts.fallback_temperatures.is_empty() {
+            // Default path: single dispatch, identical to prior behaviour.
+            decode_at(opts.temperature)?
+        } else {
+            // Temperature fallback: try each temperature, accept the first clean result.
+            let mut last: Option<(Vec<u32>, Vec<f32>, f32)> = None;
+            let mut accepted = false;
+
+            for &t in opts.fallback_temperatures {
+                let (toks, probs, nsp) = decode_at(t)?;
+
+                // Silence / no-speech: accept immediately, do not retry. Retrying would
+                // risk hallucinating tokens into a genuinely silent segment.
+                if toks.is_empty() {
+                    last = Some((toks, probs, nsp));
+                    accepted = true;
+                    break;
+                }
+
+                let text = tokenizer::decode(&toks, &model.vocab);
+                let avg_logprob = if probs.is_empty() {
+                    0.0f32
+                } else {
+                    probs.iter().sum::<f32>() / probs.len() as f32
+                };
+                let needs_fallback =
+                    is_likely_hallucination(&text, opts.compression_ratio_threshold)
+                        || (!probs.is_empty() && avg_logprob < opts.logprob_threshold);
+
+                last = Some((toks, probs, nsp));
+                if !needs_fallback {
+                    accepted = true;
+                    break;
+                }
+            }
+
+            // If no attempt passed, return the last attempt rather than nothing.
+            let _ = accepted; // documented: last attempt is the fallback
+            last.unwrap_or_default()
+        }
+    };
+    // `decode_at` closure dropped here — `last_attn` reborrow released.
+
+    // Combined OpenAI silence gate: no_speech_prob > threshold AND avg_logprob < threshold.
+    // Applied to the finalised attempt (not per-retry).
+    let avg_logprob = if token_probs.is_empty() {
+        0.0f32
+    } else {
+        token_probs.iter().sum::<f32>() / token_probs.len() as f32
+    };
+    let is_silence = !tokens.is_empty()
+        && no_speech_prob > opts.no_speech_threshold
+        && avg_logprob < opts.logprob_threshold;
+    let (tokens, token_probs) = if is_silence {
+        (Vec::new(), Vec::new())
+    } else {
+        (tokens, token_probs)
+    };
+
+    let cross_attention = if capturing && !tokens.is_empty() {
+        Some(std::mem::take(&mut last_attn))
+    } else {
+        None
+    };
+    let result_enc_len = if cross_attention.is_some() {
+        enc_len
+    } else {
+        0
     };
 
     Ok(DecodeResult {
         tokens,
         token_probs,
         detected_language,
+        cross_attention,
+        enc_len: result_enc_len,
+        no_speech_prob,
     })
 }
 
@@ -188,7 +317,7 @@ fn detect_language(ctx: &ForwardCtx<'_>, special: &SpecialTokens) -> Result<u32,
     let mut kv: Vec<LayerKVCache> = (0..ctx.n_layer)
         .map(|_| LayerKVCache::new(ctx.n_head, ctx.head_dim, cap))
         .collect();
-    let logits = forward(&[special.sot], 0, &mut kv, ctx, true)?;
+    let logits = forward(&[special.sot], 0, &mut kv, ctx, true, None)?;
     let end = (LANG_TOKEN_END as usize).min(logits.len());
     let start = (LANG_TOKEN_START as usize).min(end);
     if start >= end {
@@ -236,6 +365,7 @@ pub(crate) fn encode_prompt_text(text: &str, vocab: &[crate::model::VocabEntry])
 pub(crate) fn build_prompt(
     special: &SpecialTokens,
     lang_token: u32,
+    task_token: u32,
     timestamps: bool,
     initial_tokens: &[u32],
 ) -> Vec<u32> {
@@ -247,7 +377,7 @@ pub(crate) fn build_prompt(
     }
     prompt.push(special.sot);
     prompt.push(lang_token);
-    prompt.push(special.transcribe);
+    prompt.push(task_token);
     if !timestamps {
         prompt.push(special.no_timestamps);
     }
@@ -255,12 +385,20 @@ pub(crate) fn build_prompt(
 }
 
 /// One decoder forward pass -- updates self_kv in place, returns logits for the last token.
+///
+/// `capture` is an optional cross-attention accumulator.  When `Some`, this
+/// function writes the head- and layer-averaged cross-attention matrix rows for
+/// each selected decoder layer (see `is_alignment_layer`) via
+/// `CrossAttnCapture::layer_sink` + `commit_layer`.  Callers retrieve the
+/// result with `capture.finish()` after this function returns.
+/// Pass `None` for all paths that do not need word timestamps — zero overhead.
 pub(crate) fn forward(
     tokens: &[u32],
     start_pos: usize,
     self_kv: &mut [LayerKVCache],
     ctx: &ForwardCtx<'_>,
     causal_mask: bool,
+    mut capture: Option<&mut CrossAttnCapture>,
 ) -> Result<Vec<f32>, String> {
     let q_len = tokens.len();
     let n_state = ctx.n_state;
@@ -361,16 +499,49 @@ pub(crate) fn forward(
             Some(md.get(&format!("{pfx}.cross_attn.query.bias"))?),
         )?;
         let q_hf = to_head_first(&q.data, n_head, q_len, head_dim);
-        let attn_cross = scaled_dot_product_flat(
-            &q_hf,
-            &ctx.cross_k[layer],
-            &ctx.cross_v[layer],
-            n_head,
-            q_len,
-            ctx.enc_len,
-            head_dim,
-        );
-        let attn_cross = Tensor::from_vec(attn_cross, &[q_len, n_state]);
+        // Conditionally capture cross-attention for upper-half alignment layers.
+        // The borrow of `c.layer_scratch` ends when it's moved into `scaled_dot_product_flat`
+        // and the call returns, so `commit_layer` can re-borrow `*c` immediately after (NLL).
+        let attn_cross_data = if is_alignment_layer(layer, ctx.n_layer) {
+            if let Some(c) = capture.as_mut() {
+                let scratch = c.layer_sink();
+                let data = scaled_dot_product_flat(
+                    &q_hf,
+                    &ctx.cross_k[layer],
+                    &ctx.cross_v[layer],
+                    n_head,
+                    q_len,
+                    ctx.enc_len,
+                    head_dim,
+                    Some(scratch),
+                );
+                c.commit_layer();
+                data
+            } else {
+                scaled_dot_product_flat(
+                    &q_hf,
+                    &ctx.cross_k[layer],
+                    &ctx.cross_v[layer],
+                    n_head,
+                    q_len,
+                    ctx.enc_len,
+                    head_dim,
+                    None,
+                )
+            }
+        } else {
+            scaled_dot_product_flat(
+                &q_hf,
+                &ctx.cross_k[layer],
+                &ctx.cross_v[layer],
+                n_head,
+                q_len,
+                ctx.enc_len,
+                head_dim,
+                None,
+            )
+        };
+        let attn_cross = Tensor::from_vec(attn_cross_data, &[q_len, n_state]);
         let cross_out_name = format!("{pfx}.cross_attn.out.weight");
         let out = linear::linear_auto(
             &attn_cross,
@@ -502,7 +673,7 @@ mod tests {
     fn test_build_prompt_without_initial_tokens() {
         let special = SpecialTokens::new(51865);
         let lang = special.language_token("en");
-        let prompt = build_prompt(&special, lang, false, &[]);
+        let prompt = build_prompt(&special, lang, special.transcribe, false, &[]);
         assert_eq!(prompt[0], special.sot);
         assert_eq!(prompt[1], lang);
         assert_eq!(prompt[2], special.transcribe);
@@ -515,7 +686,7 @@ mod tests {
         let special = SpecialTokens::new(51865);
         let lang = special.language_token("en");
         let initial = vec![10u32, 20, 30];
-        let prompt = build_prompt(&special, lang, false, &initial);
+        let prompt = build_prompt(&special, lang, special.transcribe, false, &initial);
         assert_eq!(prompt[0], special.sot_prev);
         assert_eq!(prompt[1], 10);
         assert_eq!(prompt[2], 20);
@@ -531,7 +702,7 @@ mod tests {
     fn test_build_prompt_with_timestamps() {
         let special = SpecialTokens::new(51865);
         let lang = special.language_token("en");
-        let prompt = build_prompt(&special, lang, true, &[]);
+        let prompt = build_prompt(&special, lang, special.transcribe, true, &[]);
         assert_eq!(prompt.len(), 3);
         assert_eq!(prompt[0], special.sot);
         assert_eq!(prompt[2], special.transcribe);
@@ -553,7 +724,7 @@ mod tests {
         combined.append(&mut all_initial);
         let all_initial = combined;
 
-        let prompt = build_prompt(&special, lang, false, &all_initial);
+        let prompt = build_prompt(&special, lang, special.transcribe, false, &all_initial);
         // Should be: [sot_prev, 10, 20, 30, 40, sot, lang, transcribe, no_timestamps]
         assert_eq!(prompt[0], special.sot_prev);
         assert_eq!(prompt[1], 10);
@@ -577,7 +748,7 @@ mod tests {
         // Mimic decode() logic with no initial_prompt
         let all_initial = previous;
 
-        let prompt = build_prompt(&special, lang, false, &all_initial);
+        let prompt = build_prompt(&special, lang, special.transcribe, false, &all_initial);
         // Should be: [sot_prev, 50, 60, 70, sot, lang, transcribe, no_timestamps]
         assert_eq!(prompt[0], special.sot_prev);
         assert_eq!(prompt[1], 50);
@@ -585,5 +756,24 @@ mod tests {
         assert_eq!(prompt[3], 70);
         assert_eq!(prompt[4], special.sot);
         assert_eq!(prompt.len(), 8);
+    }
+
+    #[test]
+    fn test_build_prompt_translate_emits_translate_token() {
+        let special = SpecialTokens::new(51865);
+        let lang = special.language_token("en");
+        let prompt_t = build_prompt(&special, lang, special.transcribe, false, &[]);
+        let prompt_tr = build_prompt(&special, lang, special.translate, false, &[]);
+        assert_eq!(prompt_t[2], special.transcribe);
+        assert_eq!(prompt_tr[2], special.translate);
+        assert_ne!(special.transcribe, special.translate);
+    }
+
+    #[test]
+    fn test_build_prompt_translate_token_value() {
+        // Verify the well-known Whisper token IDs.
+        let special = SpecialTokens::new(51865);
+        assert_eq!(special.translate, 50358);
+        assert_eq!(special.transcribe, 50359);
     }
 }

@@ -494,6 +494,206 @@ mod tests {
         assert!(cache.v_is_f16(), "KvHalf: V should be f16");
     }
 
+    // ── Memory-footprint assertions ─────────────────────────────────────────
+    //
+    // These live here (inline `#[cfg(test)]`), NOT in a `tests/kv_dtype_memory.rs`
+    // integration test, because introspecting the actual storage footprint needs
+    // to match on the `pub(crate)` `KvStorage` enum and read `LayerKVCache`'s
+    // `pub(crate)` `k`/`v` fields. Those are crate-private, so an out-of-crate
+    // integration test cannot reach them; the check must be a unit test in this
+    // module. The `tests/kv_dtype_memory.rs` file listed in TODO.md was therefore
+    // folded into these tests.
+
+    /// Byte footprint of a `KvStorage`, computed from the real element types
+    /// (`f32` vs `half::f16`) rather than hardcoded 4/2 constants.
+    fn storage_bytes(storage: &KvStorage) -> usize {
+        match storage {
+            KvStorage::F32(arc) => arc.len() * std::mem::size_of::<f32>(),
+            KvStorage::F16(arc) => arc.len() * std::mem::size_of::<half::f16>(),
+        }
+    }
+
+    #[test]
+    fn test_kv_storage_f16_is_half_of_f32() {
+        // The whole point of the f16 KV cache: one f16 element is exactly half
+        // the size of one f32 element.
+        assert_eq!(
+            std::mem::size_of::<half::f16>() * 2,
+            std::mem::size_of::<f32>(),
+            "f16 must be exactly half the width of f32"
+        );
+
+        let len = 4096;
+        let f32_store = KvStorage::new_f32(len);
+        let f16_store = KvStorage::new_f16(len);
+        assert_eq!(storage_bytes(&f32_store), len * std::mem::size_of::<f32>());
+        assert_eq!(
+            storage_bytes(&f16_store),
+            len * std::mem::size_of::<half::f16>()
+        );
+        assert_eq!(
+            storage_bytes(&f16_store) * 2,
+            storage_bytes(&f32_store),
+            "F16 storage must hold exactly half the bytes of F32 for the same length"
+        );
+    }
+
+    #[test]
+    fn test_layer_kv_cache_footprint_per_dtype() {
+        // Realistic-ish shape so the numbers are non-trivial.
+        let n_head = 6;
+        let head_dim = 64;
+        let capacity = 256;
+        let total = n_head * capacity * head_dim;
+        let f32_bytes = total * std::mem::size_of::<f32>();
+        let f16_bytes = total * std::mem::size_of::<half::f16>();
+
+        let f32_cache = LayerKVCache::new_with_dtype(n_head, head_dim, capacity, KvCacheDtype::F32);
+        let vhalf_cache =
+            LayerKVCache::new_with_dtype(n_head, head_dim, capacity, KvCacheDtype::VHalf);
+        let kvhalf_cache =
+            LayerKVCache::new_with_dtype(n_head, head_dim, capacity, KvCacheDtype::KvHalf);
+
+        // F32: both K and V full precision.
+        assert_eq!(storage_bytes(&f32_cache.k), f32_bytes, "F32 K full width");
+        assert_eq!(storage_bytes(&f32_cache.v), f32_bytes, "F32 V full width");
+
+        // VHalf: K stays f32, only V is halved.
+        assert_eq!(
+            storage_bytes(&vhalf_cache.k),
+            f32_bytes,
+            "VHalf must keep K at full f32 width"
+        );
+        assert_eq!(
+            storage_bytes(&vhalf_cache.v),
+            f16_bytes,
+            "VHalf must halve V"
+        );
+        assert_eq!(
+            storage_bytes(&vhalf_cache.v) * 2,
+            storage_bytes(&f32_cache.v)
+        );
+
+        // KvHalf: both K and V halved.
+        assert_eq!(
+            storage_bytes(&kvhalf_cache.k),
+            f16_bytes,
+            "KvHalf must halve K"
+        );
+        assert_eq!(
+            storage_bytes(&kvhalf_cache.v),
+            f16_bytes,
+            "KvHalf must halve V"
+        );
+
+        // Whole-cache totals: VHalf saves 25%, KvHalf saves 50% vs F32.
+        let f32_total = storage_bytes(&f32_cache.k) + storage_bytes(&f32_cache.v);
+        let vhalf_total = storage_bytes(&vhalf_cache.k) + storage_bytes(&vhalf_cache.v);
+        let kvhalf_total = storage_bytes(&kvhalf_cache.k) + storage_bytes(&kvhalf_cache.v);
+        assert_eq!(
+            vhalf_total * 4,
+            f32_total * 3,
+            "VHalf must save exactly 25%"
+        );
+        assert_eq!(kvhalf_total * 2, f32_total, "KvHalf must save exactly 50%");
+    }
+
+    /// Numerically pin the pre-scaled-K trick that KvHalf relies on.
+    ///
+    /// KvHalf stores K in f16 as `k * (1/sqrt(head_dim))` and then drives QK^T
+    /// with `alpha = 1.0`. This is the risky part the parity integration test
+    /// cannot stress (the synthetic model's tiny activations make f16 lossless).
+    /// Here we inject realistic O(1..6)-magnitude K/V so f16's ~3-digit precision
+    /// actually bites, and assert:
+    ///   1. `materialize_k_head` returns `raw_k / sqrt(head_dim)` within f16
+    ///      tolerance -- i.e. the pre-scale is applied EXACTLY ONCE. A double
+    ///      pre-scale (the classic bug) would yield `raw_k / head_dim`, off by a
+    ///      further `1/sqrt(head_dim)` factor and far outside tolerance; a missing
+    ///      pre-scale would yield `raw_k`, equally far out.
+    ///   2. `materialize_v_head` (V is never pre-scaled) returns `raw_v` within
+    ///      f16 tolerance.
+    #[test]
+    fn test_kvhalf_prescaled_k_matches_f32_over_sqrt_head_dim() {
+        let n_head = 2;
+        let head_dim = 64; // sqrt(head_dim) = 8, matching real tiny/base heads
+        let capacity = 4;
+        let new_seq_len = 3;
+        let n_state = n_head * head_dim;
+
+        // Deterministic, realistic-magnitude K/V spread across a wide range so
+        // f16 rounding error is actually visible (unlike +/-0.01 synthetic weights).
+        let mut new_k = vec![0.0f32; new_seq_len * n_state];
+        let mut new_v = vec![0.0f32; new_seq_len * n_state];
+        for (i, (k, v)) in new_k.iter_mut().zip(new_v.iter_mut()).enumerate() {
+            // Non-dyadic multipliers (0.35, 0.30) so the values are NOT exactly
+            // representable in f16 -- otherwise the round-trip error would be 0
+            // and the tolerance assertion would pass vacuously.
+            *k = ((i % 37) as f32 - 18.0) * 0.35; // ~ [-6.30, 6.65]
+            *v = ((i % 53) as f32 - 26.0) * 0.30; // ~ [-7.80, 7.50]
+        }
+
+        let mut f32_cache =
+            LayerKVCache::new_with_dtype(n_head, head_dim, capacity, KvCacheDtype::F32);
+        let mut kvhalf_cache =
+            LayerKVCache::new_with_dtype(n_head, head_dim, capacity, KvCacheDtype::KvHalf);
+        f32_cache.append(&new_k, &new_v, new_seq_len);
+        kvhalf_cache.append(&new_k, &new_v, new_seq_len);
+
+        let scale = (head_dim as f32).sqrt().recip();
+        let f16_eps = half::f16::EPSILON.to_f32();
+
+        let mut k_scratch = Vec::new();
+        let mut v_scratch = Vec::new();
+        let mut max_k_err = 0.0f32;
+        let mut max_v_err = 0.0f32;
+
+        for h in 0..n_head {
+            // F32 cache keeps raw K/V exactly (f32 storage).
+            let raw_k = f32_cache.k_head(h).to_vec();
+            let raw_v = f32_cache.v_head(h).to_vec();
+
+            kvhalf_cache.materialize_k_head(h, &mut k_scratch);
+            kvhalf_cache.materialize_v_head(h, &mut v_scratch);
+            assert_eq!(k_scratch.len(), raw_k.len());
+            assert_eq!(v_scratch.len(), raw_v.len());
+
+            for (&raw, &got) in raw_k.iter().zip(k_scratch.iter()) {
+                // K must equal raw / sqrt(head_dim): pre-scale applied once.
+                let want = raw * scale;
+                let err = (want - got).abs();
+                // half-ULP round-to-nearest error is <= |want| * f16_eps / 2;
+                // allow a full eps (2x margin) plus a small absolute floor.
+                let tol = want.abs() * f16_eps + 1e-4;
+                assert!(
+                    err <= tol,
+                    "KvHalf K mismatch: raw={raw} want(raw/sqrt(d))={want} got={got} \
+                     err={err} tol={tol}"
+                );
+                max_k_err = max_k_err.max(err);
+            }
+
+            for (&raw, &got) in raw_v.iter().zip(v_scratch.iter()) {
+                // V is not pre-scaled: dequantized f16 must match raw V.
+                let err = (raw - got).abs();
+                let tol = raw.abs() * f16_eps + 1e-3;
+                assert!(
+                    err <= tol,
+                    "KvHalf V mismatch: raw={raw} got={got} err={err} tol={tol}"
+                );
+                max_v_err = max_v_err.max(err);
+            }
+        }
+
+        // Sanity floor: the injected data really does exercise f16 rounding
+        // (some non-zero error), otherwise the tolerance test would be vacuous.
+        assert!(
+            max_k_err > 0.0 && max_v_err > 0.0,
+            "expected non-zero f16 rounding error from realistic-magnitude K/V; \
+             got max_k_err={max_k_err}, max_v_err={max_v_err}"
+        );
+        eprintln!("KvHalf f16 round-trip: max_k_err={max_k_err}, max_v_err={max_v_err}");
+    }
+
     #[test]
     fn test_layer_kv_cache_vhalf_roundtrip() {
         let n_head = 2;

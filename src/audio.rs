@@ -464,51 +464,67 @@ pub fn load_audio(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
     feature = "audio-aac"
 ))]
 fn decode_with_symphonia(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperError> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
-    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let src = std::fs::File::open(path).map_err(OxiWhisperError::Io)?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
     let hint = Hint::new();
-    let fmt_opts = FormatOptions::default();
-    let meta_opts = MetadataOptions::default();
-    let dec_opts = DecoderOptions::default();
+    let dec_opts = AudioDecoderOptions::default();
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &fmt_opts, &meta_opts)
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
         .map_err(|e| OxiWhisperError::AudioFormatError(format!("symphonia probe: {e}")))?;
 
-    let mut format = probed.format;
+    // Extract all track data in a block so the &Track borrow on `format` ends
+    // before the decode loop mutably borrows it via next_packet().
+    let (track_id, sample_rate, channels, audio_params) = {
+        let track = format
+            .first_track(TrackType::Audio)
+            .ok_or_else(|| OxiWhisperError::AudioFormatError("no audio track found".to_string()))?;
 
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| OxiWhisperError::AudioFormatError("no audio track found".to_string()))?;
+        let audio_params = match &track.codec_params {
+            Some(CodecParameters::Audio(p)) => p.clone(),
+            _ => {
+                return Err(OxiWhisperError::AudioFormatError(
+                    "track has no audio codec parameters".to_string(),
+                ));
+            }
+        };
 
-    let track_id = track.id;
-    let codec_params = track.codec_params.clone();
+        let sample_rate = audio_params
+            .sample_rate
+            .ok_or_else(|| OxiWhisperError::AudioFormatError("unknown sample rate".to_string()))?;
+        let channels = audio_params
+            .channels
+            .as_ref()
+            .map(|c| c.count())
+            .unwrap_or(1);
 
-    let sample_rate = codec_params
-        .sample_rate
-        .ok_or_else(|| OxiWhisperError::AudioFormatError("unknown sample rate".to_string()))?;
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(1);
+        (track.id, sample_rate, channels, audio_params)
+    };
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &dec_opts)
+        .make_audio_decoder(&audio_params, &dec_opts)
         .map_err(|e| OxiWhisperError::AudioFormatError(format!("symphonia decoder: {e}")))?;
 
     let mut all_samples: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut chunk: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -522,7 +538,7 @@ fn decode_with_symphonia(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperE
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -537,17 +553,9 @@ fn decode_with_symphonia(path: &std::path::Path) -> Result<Vec<f32>, OxiWhisperE
             }
         };
 
-        let spec = *decoded.spec();
-        let capacity = decoded.capacity() as u64;
-
-        if sample_buf.is_none() {
-            sample_buf = Some(SampleBuffer::<f32>::new(capacity, spec));
-        }
-
-        if let Some(buf) = &mut sample_buf {
-            buf.copy_interleaved_ref(decoded);
-            all_samples.extend_from_slice(buf.samples());
-        }
+        // copy_to_vec_interleaved resizes `chunk` then fills it; extend collects all packets.
+        decoded.copy_to_vec_interleaved::<f32>(&mut chunk);
+        all_samples.extend_from_slice(&chunk);
     }
 
     let mono = downmix_to_mono(&all_samples, channels as u16);

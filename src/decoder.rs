@@ -6,6 +6,7 @@
 //! - `forward` — Decoder forward pass and prompt construction (ForwardCtx, decode, forward)
 //! - `sampler` — Token sampling strategies (decode_greedy, decode_sample)
 
+pub(crate) mod cross_attn_capture;
 pub(crate) mod forward;
 pub(crate) mod kv_cache;
 pub(crate) mod sampler;

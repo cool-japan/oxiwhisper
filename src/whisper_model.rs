@@ -260,6 +260,23 @@ impl WhisperModel {
         Ok(text)
     }
 
+    /// Transcribe 16 kHz mono f32 PCM audio and produce word-level timestamps.
+    ///
+    /// Internally enables `word_timestamps = true` and aligns the captured
+    /// cross-attention weights to encoder frames via DTW.  Requires
+    /// `opts.beam_width <= 1`; returns [`OxiWhisperError::ConfigError`] otherwise.
+    pub fn transcribe_words(
+        &self,
+        audio: &[f32],
+        opts: &TranscribeOptions<'_>,
+    ) -> Result<crate::WordTimedTranscript, OxiWhisperError> {
+        validate_options(opts)?;
+        if audio.is_empty() {
+            return Err(OxiWhisperError::InferenceFailed("Empty audio".into()));
+        }
+        crate::word_timestamps::transcribe_words_impl(&self.model_data, audio, opts)
+    }
+
     /// Transcribe 16 kHz mono f32 PCM audio to text, returning per-phase timing.
     ///
     /// Identical to [`transcribe`](Self::transcribe) but also reports how long
@@ -313,30 +330,50 @@ impl WhisperModel {
     ///
     /// For audio <= 30s, this is equivalent to [`transcribe()`](Self::transcribe).
     /// For longer audio, splits into overlapping chunks and concatenates results.
+    /// Transcribe long (>30 s) audio as a single joined string.
+    ///
+    /// Audio is split into overlapping 30-second chunks; each chunk is transcribed
+    /// independently and the results are joined with spaces. For audio ≤ 30 s this
+    /// is equivalent to [`transcribe`](Self::transcribe).
     pub fn transcribe_long(
         &self,
         audio: &[f32],
         opts: &TranscribeOptions<'_>,
+    ) -> Result<String, OxiWhisperError> {
+        self.transcribe_long_with_progress(audio, opts, |_, _| {})
+    }
+
+    /// Like [`transcribe_long`](Self::transcribe_long) but calls
+    /// `on_progress(chunk_index, total_chunks)` after each chunk completes.
+    ///
+    /// `chunk_index` is zero-based; `total_chunks` is determined before decoding
+    /// begins, so callers can display a fraction like `chunk_index + 1 / total_chunks`.
+    pub fn transcribe_long_with_progress<F: FnMut(usize, usize)>(
+        &self,
+        audio: &[f32],
+        opts: &TranscribeOptions<'_>,
+        mut on_progress: F,
     ) -> Result<String, OxiWhisperError> {
         validate_options(opts)?;
         if audio.is_empty() {
             return Err(OxiWhisperError::InferenceFailed("Empty audio".into()));
         }
 
-        const CHUNK_SAMPLES: usize = 16000 * 30; // 30 seconds
-        const OVERLAP_SAMPLES: usize = 16000; // 1 second overlap
-        const STEP_SAMPLES: usize = CHUNK_SAMPLES - OVERLAP_SAMPLES; // 29 seconds step
+        const CHUNK_SAMPLES: usize = 16000 * 30;
+        const OVERLAP_SAMPLES: usize = 16000;
+        const STEP_SAMPLES: usize = CHUNK_SAMPLES - OVERLAP_SAMPLES;
 
         if audio.len() <= CHUNK_SAMPLES {
+            on_progress(0, 1);
             return self.transcribe(audio, opts);
         }
 
-        // Try VAD-aware splitting first, fall back to fixed chunking
         let split_points = compute_split_points(audio, STEP_SAMPLES, CHUNK_SAMPLES);
+        let total = split_points.len();
 
         let mut texts: Vec<String> = Vec::new();
         let mut prev_text: Option<String> = None;
-        for (chunk_start, chunk_end) in split_points {
+        for (i, (chunk_start, chunk_end)) in split_points.into_iter().enumerate() {
             let chunk = &audio[chunk_start..chunk_end];
             let mut chunk_opts = opts.clone();
             // Use previous segment text as initial_prompt for cross-chunk coherence
@@ -351,6 +388,7 @@ impl WhisperModel {
             } else {
                 prev_text = None;
             }
+            on_progress(i, total);
         }
 
         Ok(texts.join(" "))
@@ -367,6 +405,20 @@ impl WhisperModel {
         audio: &[f32],
         opts: &TranscribeOptions<'_>,
     ) -> Result<TranscribeResult, OxiWhisperError> {
+        self.transcribe_long_segmented_with_progress(audio, opts, |_, _| {})
+    }
+
+    /// Like [`transcribe_long_segmented`](Self::transcribe_long_segmented) but calls
+    /// `on_progress(chunk_index, total_chunks)` after each chunk completes.
+    ///
+    /// `chunk_index` is zero-based; `total_chunks` is the number of chunks determined
+    /// before decoding begins, so progress can be presented as `chunk_index + 1 / total_chunks`.
+    pub fn transcribe_long_segmented_with_progress<F: FnMut(usize, usize)>(
+        &self,
+        audio: &[f32],
+        opts: &TranscribeOptions<'_>,
+        mut on_progress: F,
+    ) -> Result<TranscribeResult, OxiWhisperError> {
         validate_options(opts)?;
         if audio.is_empty() {
             return Err(OxiWhisperError::InferenceFailed("Empty audio".into()));
@@ -377,17 +429,19 @@ impl WhisperModel {
         const STEP_SAMPLES: usize = CHUNK_SAMPLES - OVERLAP_SAMPLES;
 
         if audio.len() <= CHUNK_SAMPLES {
+            on_progress(0, 1);
             return self.transcribe_segmented(audio, opts);
         }
 
         let split_points = compute_split_points(audio, STEP_SAMPLES, CHUNK_SAMPLES);
+        let total = split_points.len();
 
         let mut all_texts: Vec<String> = Vec::new();
         let mut all_segments: Vec<Segment> = Vec::new();
         let mut detected_language: Option<String> = None;
         let mut prev_text: Option<String> = None;
 
-        for (chunk_start, chunk_end) in &split_points {
+        for (i, (chunk_start, chunk_end)) in split_points.iter().enumerate() {
             let chunk = &audio[*chunk_start..*chunk_end];
             let chunk_offset_seconds = *chunk_start as f32 / 16000.0;
 
@@ -426,6 +480,8 @@ impl WhisperModel {
             if detected_language.is_none() {
                 detected_language = result.language;
             }
+
+            on_progress(i, total);
         }
 
         Ok(TranscribeResult {
@@ -451,6 +507,18 @@ impl WhisperModel {
         opts: &TranscribeOptions<'_>,
         vad_config: &vad::VadConfig,
     ) -> Result<TranscribeResult, OxiWhisperError> {
+        self.transcribe_long_with_vad_with_progress(audio, opts, vad_config, |_, _| {})
+    }
+
+    /// Like [`transcribe_long_with_vad`](Self::transcribe_long_with_vad) but calls
+    /// `on_progress(chunk_index, total_chunks)` after each chunk completes.
+    pub fn transcribe_long_with_vad_with_progress<F: FnMut(usize, usize)>(
+        &self,
+        audio: &[f32],
+        opts: &TranscribeOptions<'_>,
+        vad_config: &vad::VadConfig,
+        mut on_progress: F,
+    ) -> Result<TranscribeResult, OxiWhisperError> {
         validate_options(opts)?;
         if audio.is_empty() {
             return Err(OxiWhisperError::InferenceFailed("Empty audio".into()));
@@ -461,18 +529,20 @@ impl WhisperModel {
         const STEP_SAMPLES: usize = CHUNK_SAMPLES - OVERLAP_SAMPLES;
 
         if audio.len() <= CHUNK_SAMPLES {
+            on_progress(0, 1);
             return self.transcribe_segmented(audio, opts);
         }
 
         let split_points =
             compute_split_points_with_vad(audio, STEP_SAMPLES, CHUNK_SAMPLES, vad_config);
+        let total = split_points.len();
 
         let mut all_texts: Vec<String> = Vec::new();
         let mut all_segments: Vec<Segment> = Vec::new();
         let mut detected_language: Option<String> = None;
         let mut prev_text: Option<String> = None;
 
-        for (chunk_start, chunk_end) in &split_points {
+        for (i, (chunk_start, chunk_end)) in split_points.iter().enumerate() {
             let chunk = &audio[*chunk_start..*chunk_end];
             let chunk_offset_seconds = *chunk_start as f32 / 16000.0;
 
@@ -507,6 +577,8 @@ impl WhisperModel {
             if detected_language.is_none() {
                 detected_language = result.language;
             }
+
+            on_progress(i, total);
         }
 
         Ok(TranscribeResult {
@@ -665,6 +737,16 @@ impl WhisperModel {
         stream::StreamTranscriber::new(self, opts)
     }
 
+    /// Return the model width `d_model` (the encoder hidden state dimension,
+    /// `n_audio_state`).
+    ///
+    /// This reads the loaded hyperparameters directly, so it is available
+    /// without running the encoder. It equals the second dimension of the
+    /// tensor returned by [`encoder_output`](Self::encoder_output).
+    pub fn d_model(&self) -> usize {
+        self.model_data.hparams.n_audio_state
+    }
+
     /// Extract the encoder's output representation for the given audio.
     ///
     /// Returns a tensor of shape `[seq_len, n_audio_state]` where `seq_len = n_frames / 2`.
@@ -719,6 +801,227 @@ impl WhisperModel {
             float32_params: float32,
             estimated_memory_bytes: mem,
         }
+    }
+
+    /// Run the full speaker-diarization pipeline with a caller-supplied speaker
+    /// embedder.
+    ///
+    /// The stages are wired end to end:
+    ///
+    /// 1. **VAD** — [`vad::detect_speech`] isolates speech regions.
+    /// 2. **Sub-segmentation** — [`window_speech`](crate::diarize::segment::window_speech)
+    ///    tiles each region into overlapping fixed windows.
+    /// 3. **Embedding** — each window is embedded with `embedder`.
+    /// 4. **Clustering** — [`cluster_speakers`](crate::diarize::cluster::cluster_speakers)
+    ///    groups the embeddings into speakers.
+    /// 5. **Resegmentation** — [`resegment`](crate::diarize::reseg::resegment)
+    ///    turns the per-window labels into contiguous, sorted, non-overlapping
+    ///    [`SpeakerSegment`](crate::diarize::SpeakerSegment)s.
+    ///
+    /// The reported `num_speakers` is derived from the distinct speakers in the
+    /// final segments, so it can never drift from the returned segmentation.
+    ///
+    /// Audio is assumed to be mono PCM at [`crate::mel::WHISPER_SAMPLE_RATE`].
+    /// Silent input (no VAD regions) or input too short to fill a single window
+    /// yields an empty result with `num_speakers == 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiWhisperError`] if `opts` fails validation, if the embedder
+    /// fails on any window, or if clustering rejects the embeddings.
+    #[cfg(feature = "diarization")]
+    pub fn diarize_with_embedder(
+        &self,
+        audio: &[f32],
+        opts: &crate::diarize::DiarizeOptions,
+        embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    ) -> Result<crate::diarize::DiarizeResult, OxiWhisperError> {
+        use crate::diarize::{DiarizeResult, SpeakerSegment, cluster, reseg, segment};
+
+        opts.validate()?;
+        let sr = mel::WHISPER_SAMPLE_RATE;
+
+        let empty = || DiarizeResult {
+            segments: Vec::new(),
+            num_speakers: 0,
+        };
+
+        // Stage 1: VAD.
+        let regions = vad::detect_speech(audio, sr, &opts.vad);
+        if regions.is_empty() {
+            return Ok(empty());
+        }
+
+        // Stage 2: overlapping sub-segmentation.
+        let windows =
+            segment::window_speech(&regions, sr, opts.window_s, opts.hop_s, opts.min_duration_s);
+        if windows.is_empty() {
+            return Ok(empty());
+        }
+
+        // Stage 3: embed every window. Bounds are clamped defensively so a
+        // degenerate window index can never index past the audio buffer.
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(windows.len());
+        for window in &windows {
+            let end = window.end.min(audio.len());
+            let start = window.start.min(end);
+            let embedding = embedder.embed(&audio[start..end], sr)?;
+            embeddings.push(embedding);
+        }
+
+        // Stage 4: cluster the embeddings into speakers.
+        let (labels, _k) = cluster::cluster_speakers(
+            &embeddings,
+            &opts.clustering,
+            opts.num_speakers,
+            opts.min_speakers,
+            opts.max_speakers,
+        )?;
+
+        // Stage 5: resegment per-window labels into clean speaker turns.
+        let segments = reseg::resegment(&windows, &labels, sr, opts.min_duration_s);
+
+        // Derive the speaker count from the final segments so it always matches
+        // the returned segmentation.
+        let num_speakers = segments
+            .iter()
+            .map(|s: &SpeakerSegment| s.speaker)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        Ok(DiarizeResult {
+            segments,
+            num_speakers,
+        })
+    }
+
+    /// Run speaker diarization using the built-in Whisper-encoder baseline
+    /// embedder.
+    ///
+    /// This is a convenience wrapper over
+    /// [`diarize_with_embedder`](Self::diarize_with_embedder) that constructs a
+    /// [`WhisperEncoderEmbedder`](crate::diarize::embed::WhisperEncoderEmbedder)
+    /// over `self`.
+    ///
+    /// # Accuracy caveat (read this)
+    ///
+    /// The baseline embedder mean-pools Whisper encoder features, and Whisper's
+    /// encoder is trained to be largely speaker-**invariant** (it encodes
+    /// phonetic/acoustic content for ASR). Its embeddings therefore cluster only
+    /// **weakly** by speaker, so this convenience path is **low-accuracy** — it
+    /// exists for a no-extra-model demo and structural testing, not for
+    /// production diarization. For real accuracy, export a speaker-discriminative
+    /// model (ECAPA-TDNN / x-vector) and pass an
+    #[cfg_attr(
+        feature = "onnx",
+        doc = "[`EcapaOnnx`](crate::diarize::embed::EcapaOnnx) (or any other"
+    )]
+    #[cfg_attr(not(feature = "onnx"), doc = "`EcapaOnnx` (or any other")]
+    /// [`SpeakerEmbedder`](crate::diarize::embed::SpeakerEmbedder)) to
+    /// [`diarize_with_embedder`](Self::diarize_with_embedder).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`diarize_with_embedder`](Self::diarize_with_embedder).
+    #[cfg(feature = "diarization")]
+    pub fn diarize(
+        &self,
+        audio: &[f32],
+        opts: &crate::diarize::DiarizeOptions,
+    ) -> Result<crate::diarize::DiarizeResult, OxiWhisperError> {
+        let embedder = crate::diarize::embed::WhisperEncoderEmbedder::new(self);
+        self.diarize_with_embedder(audio, opts, &embedder)
+    }
+
+    /// Transcribe audio and attribute every word to a speaker, using the
+    /// built-in Whisper-encoder baseline embedder.
+    ///
+    /// This is the convenience path. It runs
+    /// [`transcribe_words`](Self::transcribe_words) (forcing
+    /// `word_timestamps = true` on a clone of `t_opts`), runs
+    /// [`diarize`](Self::diarize) for the speaker timeline, then fuses the two
+    /// with [`attribute_words`](crate::diarize::attribute::attribute_words).
+    ///
+    /// # Accuracy caveat (read this)
+    ///
+    /// The speaker timeline comes from [`diarize`](Self::diarize), whose baseline
+    /// embedder mean-pools Whisper encoder features. Whisper's encoder is largely
+    /// speaker-**invariant**, so this path is **low-accuracy** — it exists for a
+    /// no-extra-model demo, not production. For real speaker attribution pass a
+    /// speaker-discriminative embedder to
+    /// [`transcribe_with_speakers_using_embedder`](Self::transcribe_with_speakers_using_embedder).
+    /// The fusion itself assigns exactly one speaker per word, so overlapped
+    /// speech is mis-attributed (see
+    /// [`attribute_words`](crate::diarize::attribute::attribute_words)).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`transcribe_words`](Self::transcribe_words)
+    /// (for example [`OxiWhisperError::ConfigError`] when `t_opts.beam_width > 1`,
+    /// which word timestamps forbid) or from [`diarize`](Self::diarize).
+    #[cfg(feature = "diarization")]
+    pub fn transcribe_with_speakers(
+        &self,
+        audio: &[f32],
+        t_opts: &TranscribeOptions<'_>,
+        d_opts: &crate::diarize::DiarizeOptions,
+    ) -> Result<crate::diarize::attribute::SpeakerTranscript, OxiWhisperError> {
+        let diarization = self.diarize(audio, d_opts)?;
+        self.fuse_transcription_with_speakers(audio, t_opts, &diarization)
+    }
+
+    /// Transcribe audio and attribute every word to a speaker, using a
+    /// caller-supplied speaker embedder (the production path).
+    ///
+    /// Identical to [`transcribe_with_speakers`](Self::transcribe_with_speakers)
+    /// but obtains the speaker timeline from
+    /// [`diarize_with_embedder`](Self::diarize_with_embedder), so passing a
+    /// speaker-discriminative model (ECAPA-TDNN / x-vector) yields real speaker
+    /// accuracy. The word-fusion step is shared with the baseline path, so the
+    /// same one-speaker-per-word overlap limitation applies (see
+    /// [`attribute_words`](crate::diarize::attribute::attribute_words)).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`transcribe_words`](Self::transcribe_words) or
+    /// [`diarize_with_embedder`](Self::diarize_with_embedder).
+    #[cfg(feature = "diarization")]
+    pub fn transcribe_with_speakers_using_embedder(
+        &self,
+        audio: &[f32],
+        t_opts: &TranscribeOptions<'_>,
+        d_opts: &crate::diarize::DiarizeOptions,
+        embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    ) -> Result<crate::diarize::attribute::SpeakerTranscript, OxiWhisperError> {
+        let diarization = self.diarize_with_embedder(audio, d_opts, embedder)?;
+        self.fuse_transcription_with_speakers(audio, t_opts, &diarization)
+    }
+
+    /// Shared word-timestamp + speaker-timeline fusion for the two
+    /// speaker-attributed entry points.
+    ///
+    /// Clones `t_opts`, forces `word_timestamps = true`, runs
+    /// [`transcribe_words`](Self::transcribe_words), and fuses the resulting
+    /// words with `diarization.segments` via
+    /// [`attribute_words`](crate::diarize::attribute::attribute_words). Keeping
+    /// this private avoids duplicating the fusion orchestration across the
+    /// baseline and embedder paths; the fusion algorithm itself lives entirely in
+    /// [`crate::diarize::attribute`].
+    #[cfg(feature = "diarization")]
+    fn fuse_transcription_with_speakers(
+        &self,
+        audio: &[f32],
+        t_opts: &TranscribeOptions<'_>,
+        diarization: &crate::diarize::DiarizeResult,
+    ) -> Result<crate::diarize::attribute::SpeakerTranscript, OxiWhisperError> {
+        let mut word_opts = t_opts.clone();
+        word_opts.word_timestamps = true;
+        let transcript = self.transcribe_words(audio, &word_opts)?;
+        Ok(crate::diarize::attribute::attribute_words(
+            &transcript.words,
+            &diarization.segments,
+            transcript.language,
+        ))
     }
 }
 
@@ -1268,6 +1571,12 @@ mod tests {
             compression_ratio_threshold: 2.4,
             previous_tokens: None,
             kv_cache_dtype: crate::KvCacheDtype::F32,
+            task: crate::Task::Transcribe,
+            fallback_temperatures: &[],
+            logprob_threshold: -1.0,
+            word_timestamps: false,
+            no_speech_threshold: 0.6,
+            suppress_blank: true,
         };
         assert!(validate_options(&opts_custom).is_ok());
     }
@@ -1436,6 +1745,68 @@ mod tests {
                 "encoder output value at index {i} is not finite: {v}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn test_progress_callback_fires_once_per_chunk() {
+        let model_path = crate::test_utils::generate_synthetic_model();
+        let model = WhisperModel::from_file(&model_path).expect("synthetic model should load");
+        let _ = std::fs::remove_file(&model_path);
+
+        // 60 s of silence — forces the multi-chunk path (>30 s).
+        let audio = vec![0.0f32; 16000 * 60];
+        let opts = TranscribeOptions::default();
+
+        let split_points = compute_split_points(&audio, 16000 * 29, 16000 * 30);
+        let expected_total = split_points.len();
+
+        let mut fired: Vec<(usize, usize)> = Vec::new();
+        let _ = model.transcribe_long_with_progress(&audio, &opts, |idx, total| {
+            fired.push((idx, total));
+        });
+
+        assert_eq!(
+            fired.len(),
+            expected_total,
+            "callback should fire once per chunk"
+        );
+        assert_eq!(fired[0].1, expected_total, "total reported correctly");
+        assert_eq!(
+            fired.last().map(|(i, _)| *i),
+            Some(expected_total - 1),
+            "last chunk_index should be total - 1"
+        );
+    }
+
+    #[test]
+    fn test_progress_segmented_fires_once_per_chunk() {
+        let model_path = crate::test_utils::generate_synthetic_model();
+        let model = WhisperModel::from_file(&model_path).expect("synthetic model should load");
+        let _ = std::fs::remove_file(&model_path);
+
+        let audio = vec![0.0f32; 16000 * 62];
+        let opts = TranscribeOptions {
+            timestamps: true,
+            ..TranscribeOptions::default()
+        };
+
+        let split_points = compute_split_points(&audio, 16000 * 29, 16000 * 30);
+        let expected_total = split_points.len();
+
+        let mut count = 0usize;
+        let _ = model.transcribe_long_segmented_with_progress(&audio, &opts, |_, _| {
+            count += 1;
+        });
+
+        assert_eq!(
+            count, expected_total,
+            "segmented callback fires once per chunk"
+        );
     }
 }
 

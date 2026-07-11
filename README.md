@@ -174,6 +174,68 @@ let opts = TranscribeOptions {
 };
 ```
 
+## Speaker Diarization
+
+Speaker-attributed transcription ("who spoke when") is available behind the
+`diarization` feature. Read the constraints below **before** using it —
+they are load-bearing, not boilerplate disclaimers.
+
+**(a) An external speaker-embedding model is required for real accuracy.**
+oxiwhisper does **not** ship a speaker-embedding model. To get genuine
+speaker discrimination you must supply your own ECAPA-TDNN / x-vector model,
+exported to ONNX, and load it with `EcapaOnnx::from_path` (requires the
+`onnx` feature in addition to `diarization`). oxiwhisper only implements the
+pipeline around the embedder (VAD, windowing, clustering, resegmentation,
+ASR-word fusion) — it is not a source of a pretrained speaker model.
+
+**(b) The built-in `WhisperEncoderEmbedder` baseline is LOW-ACCURACY.** It
+mean-pools features straight out of the Whisper audio encoder. Whisper's
+encoder is trained to be largely speaker-**invariant** — it encodes
+phonetic/acoustic content for ASR, not speaker identity — so embeddings
+derived from it cluster only weakly by speaker. This baseline exists purely
+as a no-extra-model demo and for structural testing of the pipeline. **It
+must never be presented as production diarization.** For anything that
+matters, pass a real `EcapaOnnx` (or any other speaker-discriminative
+`SpeakerEmbedder` implementation) to `diarize_with_embedder` /
+`transcribe_with_speakers_using_embedder` instead of using the `diarize` /
+`transcribe_with_speakers` convenience wrappers that default to the
+baseline.
+
+**(c) Usage:**
+
+```
+cargo run --example diarize --features diarization -- <model> <audio> --speakers 2
+```
+
+Add `--embedder ecapa:<path-to-onnx-model>` (with `--features
+diarization,onnx`) to use a real speaker-embedding model instead of the
+baseline, `--clustering ahc|spectral` to pick the clustering strategy, and
+`--rttm` to print NIST RTTM instead of a speaker-labeled transcript. See
+`examples/diarize.rs` for the full CLI and
+[`DiarizeOptions`](https://docs.rs/oxiwhisper/latest/oxiwhisper/diarize/struct.DiarizeOptions.html)
+for programmatic control (number of speakers, window/hop sizes, minimum
+segment duration, clustering threshold, VAD config).
+
+Programmatically, the entry points are:
+
+- `WhisperModel::diarize` / `diarize_with_embedder` — speaker timeline only
+  (`DiarizeResult`: chronological `SpeakerSegment`s plus a speaker count).
+- `WhisperModel::transcribe_with_speakers` /
+  `transcribe_with_speakers_using_embedder` — word-level ASR fused with the
+  speaker timeline into a `SpeakerTranscript` (one `SpeakerTurn` per
+  contiguous same-speaker run of words). The `_using_embedder` variants take
+  an explicit `&dyn SpeakerEmbedder`; the plain variants default to the
+  low-accuracy Whisper-encoder baseline described in (b).
+- `write_rttm` / `rttm_string` — NIST RTTM export of a `DiarizeResult`.
+- `labeled_transcript` / `labeled_transcript_timed` — human-readable
+  `[SPEAKER_k]`-prefixed rendering of a `SpeakerTranscript`.
+
+DER (Diarization Error Rate) / JER (Jaccard Error Rate) evaluation against a
+reference RTTM lives in the `diarize::metrics` module (`der`, `jer`,
+`parse_rttm`, Hungarian-algorithm speaker mapping) — it is a separate,
+opt-in step for measuring accuracy against ground truth, not something the
+transcription path computes automatically.
+
 ## Feature Flags
 
 | Feature      | Description                                                                                         | Default |
@@ -188,6 +250,7 @@ let opts = TranscribeOptions {
 | `audio-aac`  | AAC/M4A audio decoding via symphonia                                                                | off     |
 | `audio-opus` | Opus audio decoding via opus-decoder + ogg                                                          | off     |
 | `audio-all`  | Enables all audio format decoders above                                                             | off     |
+| `diarization`| Speaker diarization pipeline (VAD, embedding, AHC/spectral clustering, RTTM/DER). Needs an external speaker-embedding model for real accuracy — see "Speaker Diarization" above. | off |
 | `test-utils` | Exposes internal test helpers. For integration testing only; not for normal use.                    | off     |
 
 ## Architecture
@@ -210,6 +273,7 @@ stream, subtitle, dtw, hallucination, onnx_loader, test_utils, threading, whispe
 | `transcribe` | Simple CLI: `cargo run --example transcribe -- model.bin audio.wav` |
 | `streaming` | Real-time streaming with `StreamTranscriber` |
 | `batch_transcribe` | Multi-file batch transcription |
+| `diarize` | Speaker-attributed transcription / RTTM export: `cargo run --example diarize --features diarization -- model.bin audio.wav --speakers 2` (see "Speaker Diarization" above) |
 | `bench` | Performance benchmarking with RTF reporting |
 | `profile_attention` | Attention kernel profiling (sgemm vs tiled) |
 

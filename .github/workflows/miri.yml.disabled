@@ -1,0 +1,153 @@
+name: Miri
+
+# Scoped undefined-behaviour check for oxiwhisper's `unsafe` surface.
+#
+# This crate has ~28 `unsafe` blocks: raw-pointer `matrixmultiply::sgemm`
+# calls (src/decoder/sdpa.rs, src/attention.rs), scalar/AVX2 quantized-dot
+# kernels (src/quantize/), a NEON kernel (aarch64-only), and file-backed
+# `mmap` loading (src/model.rs, src/whisper_model.rs). Miri can only usefully
+# interpret a SUBSET of this surface (see "Excluded from Miri" below) — this
+# workflow runs exactly that subset, deliberately, rather than the whole test
+# suite, so that CI never goes red for reasons that have nothing to do with
+# undefined behaviour (missing CPU features, unsupported syscalls, or
+# multi-minute-plus interpreter runtimes).
+#
+# ─── Excluded from Miri (verified, not guessed) ─────────────────────────────
+#
+#   * `model::tests::test_load_mmap_*` / any other `test_load_mmap_*` test —
+#     Miri cannot do file-backed `mmap`, even with
+#     `-Zmiri-disable-isolation`: "Miri does not support file-backed memory
+#     mappings". Confirmed locally: `test_load_mmap_smoke` alone did not
+#     finish within 15 minutes under Miri (vs ~1s natively).
+#
+#   * `model::tests::test_load_synthetic_gguf` /
+#     `model::tests::test_load_gguf_unsupported_dtype` — ran for >39 minutes
+#     under Miri without completing (full GGUF parse + tensor materialisation
+#     is too much MIR interpretation to be practical in CI).
+#
+#   * `src/quantize/dot_simd_neon.rs` — `#[cfg(target_arch = "aarch64")]`
+#     only; it is not even compiled on the x86_64 runners used here, so there
+#     is nothing for Miri to check on this target. (NEON correctness is
+#     covered by the native, non-Miri test suite on aarch64 hosts.)
+#
+# ─── What IS covered ─────────────────────────────────────────────────────────
+#
+#   * Job `sgemm-and-scalar`: the raw-pointer `matrixmultiply::sgemm` unsafe
+#     blocks in `src/decoder/sdpa.rs` and `src/attention.rs`, plus the scalar
+#     quantized-dot kernels in `src/quantize/`. Under Miri's DEFAULT flags,
+#     `is_x86_feature_detected!("avx2")` reports false (Miri does not perform
+#     real CPUID detection), so `matrixmultiply::sgemm` transparently falls
+#     back to its portable (non-SIMD) kernel — which genuinely executes and
+#     is genuinely checked here.
+#
+#   * Job `avx2-intrinsics`: the explicit AVX2+FMA intrinsics in
+#     `src/quantize/dot_simd_x86.rs`, forced on via
+#     `MIRIFLAGS="-C target-feature=+avx2,+fma"` (a compile-time flag, so
+#     `is_x86_feature_detected!` short-circuits true via `cfg(target_feature)`
+#     without needing runtime CPUID support from the interpreter).
+#
+# Both invocations below were run and verified locally before being committed
+# here (see PR description / commit message for the actual transcript):
+#   cargo +nightly miri nextest run --lib quantize:: decoder::sdpa::tests attention::tests
+#     -> 66 tests run: 66 passed, 329 skipped (~4m50s wall)
+#   MIRIFLAGS="-C target-feature=+avx2,+fma" cargo +nightly miri nextest run --lib quantize::tests::test_dot
+#     -> 8 tests run: 8 passed, 387 skipped (~20s wall)
+#
+# `attention::tests::test_self_attention_shape` and
+# `test_cross_attention_shape` are individually slow under Miri (~3 minutes
+# each — Miri reported them as SLOW at the 60s/120s/180s marks) but they DO
+# complete; the whole first job finishes in well under 10 minutes, so the
+# filter is left as specified rather than narrowed further.
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - "0.[0-9]+.[0-9]+"
+  pull_request:
+    branches:
+      - master
+      - main
+      - "0.[0-9]+.[0-9]+"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sgemm-and-scalar:
+    name: Miri (sgemm fallback + scalar quant kernels)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-miri-sgemm-scalar"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo miri setup
+        run: cargo +nightly miri setup
+
+      # Covers: src/decoder/sdpa.rs + src/attention.rs (sgemm, portable
+      # fallback kernel under Miri's default "no AVX2 detected" behaviour)
+      # and src/quantize/ scalar dot kernels.
+      #
+      # Deliberately NOT `--all-targets` / `--workspace`: this crate has
+      # integration tests (tests/*.rs) that load real/synthetic GGUF models
+      # and/or mmap files, which are excluded for the reasons documented
+      # above the `on:` block.
+      - name: Run Miri (default flags — sgemm portable kernel path)
+        run: |
+          cargo +nightly miri nextest run --lib \
+            quantize:: decoder::sdpa::tests attention::tests \
+            --no-fail-fast
+
+  avx2-intrinsics:
+    name: Miri (AVX2+FMA quant-dot intrinsics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-miri-avx2"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo miri setup
+        run: cargo +nightly miri setup
+
+      # Covers: src/quantize/dot_simd_x86.rs (explicit AVX2+FMA intrinsics).
+      # `-C target-feature=+avx2,+fma` is a *compile-time* flag: it makes
+      # `cfg(target_feature = "avx2")` true, so `is_x86_feature_detected!`
+      # short-circuits to `true` without needing Miri to emulate real CPUID
+      # runtime detection.
+      - name: Run Miri (forced AVX2+FMA — explicit intrinsics)
+        env:
+          MIRIFLAGS: "-C target-feature=+avx2,+fma"
+        run: |
+          cargo +nightly miri nextest run --lib \
+            quantize::tests::test_dot \
+            --no-fail-fast

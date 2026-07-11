@@ -99,6 +99,30 @@ pub(crate) fn load_gguf_from_reader<R: Read + Seek>(
 
 // ── Tensor loading ────────────────────────────────────────────────────────────
 
+/// Reject a tensor whose declared data range does not fit within the file.
+///
+/// This is the allocation guard that turns a file-controlled length into a
+/// bounded allocation: since `need` bytes must physically exist between
+/// `abs_offset` and `stream_len`, any buffer we subsequently allocate is at
+/// most the size of the input, never an attacker-chosen astronomical value.
+fn ensure_tensor_data_fits(
+    name: &str,
+    abs_offset: u64,
+    need: u64,
+    stream_len: u64,
+) -> Result<(), OxiWhisperError> {
+    let end = abs_offset.checked_add(need).ok_or_else(|| {
+        OxiWhisperError::InvalidModel(format!("Tensor '{name}' data range overflows u64"))
+    })?;
+    if end > stream_len {
+        return Err(OxiWhisperError::InvalidModel(format!(
+            "Tensor '{name}' data extends beyond end of file \
+             (needs {need} bytes at offset {abs_offset}, file is {stream_len} bytes)"
+        )));
+    }
+    Ok(())
+}
+
 fn load_tensors<R: Read + Seek>(
     reader: &mut R,
     infos: &[TensorInfo],
@@ -113,8 +137,28 @@ fn load_tensors<R: Read + Seek>(
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
     let mut quantized_tensors: HashMap<String, QuantizedTensor> = HashMap::new();
 
+    // Total length of the input stream. Every tensor allocation below is bounded
+    // against `stream_len` so a file-controlled dimension/length can never drive
+    // an unbounded (OOM) allocation: we refuse to allocate a buffer whose backing
+    // bytes do not actually exist within the file.
+    let stream_len = reader.seek(SeekFrom::End(0)).map_err(OxiWhisperError::Io)?;
+
     for info in infos {
-        let n_elements = info.n_elements() as usize;
+        // Element count is computed with overflow checking; adversarial dims
+        // whose product exceeds `u64` (or `usize` on this platform) are rejected
+        // rather than silently wrapping or panicking.
+        let n_elements_u64 = info.n_elements().ok_or_else(|| {
+            OxiWhisperError::InvalidModel(format!(
+                "Tensor '{}' element count overflows u64",
+                info.name
+            ))
+        })?;
+        let n_elements = usize::try_from(n_elements_u64).map_err(|_| {
+            OxiWhisperError::InvalidModel(format!(
+                "Tensor '{}' element count {n_elements_u64} does not fit in usize",
+                info.name
+            ))
+        })?;
         // GGUF dims are innermost-first; convert to usize for shape
         let shape: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
         let is_large_2d = shape.len() == 2 && n_elements > 1024;
@@ -129,6 +173,13 @@ fn load_tensors<R: Read + Seek>(
 
         match info.ggml_type {
             GgmlType::F32 => {
+                let need = n_elements_u64.checked_mul(4).ok_or_else(|| {
+                    OxiWhisperError::InvalidModel(format!(
+                        "Tensor '{}' byte size overflows u64",
+                        info.name
+                    ))
+                })?;
+                ensure_tensor_data_fits(&info.name, abs_offset, need, stream_len)?;
                 let mut data = vec![0.0f32; n_elements];
                 let byte_slice = unsafe {
                     std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n_elements * 4)
@@ -138,6 +189,13 @@ fn load_tensors<R: Read + Seek>(
             }
 
             GgmlType::F16 => {
+                let need = n_elements_u64.checked_mul(2).ok_or_else(|| {
+                    OxiWhisperError::InvalidModel(format!(
+                        "Tensor '{}' byte size overflows u64",
+                        info.name
+                    ))
+                })?;
+                ensure_tensor_data_fits(&info.name, abs_offset, need, stream_len)?;
                 let mut raw = vec![0u16; n_elements];
                 let byte_slice = unsafe {
                     std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, n_elements * 2)
@@ -152,7 +210,13 @@ fn load_tensors<R: Read + Seek>(
 
             GgmlType::Q4_0 => {
                 let n_blocks = n_elements / Q4_0_BLOCK_SIZE;
-                let n_bytes = n_blocks * Q4_0_BLOCK_BYTES;
+                let n_bytes = n_blocks.checked_mul(Q4_0_BLOCK_BYTES).ok_or_else(|| {
+                    OxiWhisperError::InvalidModel(format!(
+                        "Tensor '{}' byte size overflows usize",
+                        info.name
+                    ))
+                })?;
+                ensure_tensor_data_fits(&info.name, abs_offset, n_bytes as u64, stream_len)?;
                 let mut raw = vec![0u8; n_bytes];
                 reader.read_exact(&mut raw).map_err(OxiWhisperError::Io)?;
 
@@ -182,7 +246,13 @@ fn load_tensors<R: Read + Seek>(
 
             GgmlType::Q5_0 => {
                 let n_blocks = n_elements / Q5_0_BLOCK_SIZE;
-                let n_bytes = n_blocks * Q5_0_BLOCK_BYTES;
+                let n_bytes = n_blocks.checked_mul(Q5_0_BLOCK_BYTES).ok_or_else(|| {
+                    OxiWhisperError::InvalidModel(format!(
+                        "Tensor '{}' byte size overflows usize",
+                        info.name
+                    ))
+                })?;
+                ensure_tensor_data_fits(&info.name, abs_offset, n_bytes as u64, stream_len)?;
                 let mut raw = vec![0u8; n_bytes];
                 reader.read_exact(&mut raw).map_err(OxiWhisperError::Io)?;
 
@@ -211,7 +281,13 @@ fn load_tensors<R: Read + Seek>(
 
             GgmlType::Q8_0 => {
                 let n_blocks = n_elements / Q8_0_BLOCK_SIZE;
-                let n_bytes = n_blocks * Q8_0_BLOCK_BYTES;
+                let n_bytes = n_blocks.checked_mul(Q8_0_BLOCK_BYTES).ok_or_else(|| {
+                    OxiWhisperError::InvalidModel(format!(
+                        "Tensor '{}' byte size overflows usize",
+                        info.name
+                    ))
+                })?;
+                ensure_tensor_data_fits(&info.name, abs_offset, n_bytes as u64, stream_len)?;
                 let mut raw = vec![0u8; n_bytes];
                 reader.read_exact(&mut raw).map_err(OxiWhisperError::Io)?;
 
@@ -385,3 +461,9 @@ pub(crate) fn read_string<R: Read>(r: &mut R) -> Result<String, OxiWhisperError>
     String::from_utf8(buf)
         .map_err(|e| OxiWhisperError::InvalidModel(format!("GGUF string is not valid UTF-8: {e}")))
 }
+
+// Property-based adversarial hardening tests live in a child file to keep this
+// module well under the 2000-line ceiling.
+#[cfg(test)]
+#[path = "parse_proptest.rs"]
+mod parse_proptest;

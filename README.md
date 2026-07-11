@@ -2,18 +2,21 @@
 
 Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 
-> 17,101 LoC | 399 tests | 24 modules | 10 examples | Apache-2.0
+> 23,516 LoC | 579 tests | 27 modules | 12 examples | Apache-2.0
 
 ## Status
 
 | Component | Status | Tests |
 |-----------|--------|-------|
-| Core inference (encoder/decoder) | Stable | 399 passing |
+| Core inference (encoder/decoder) | Stable | 579 passing |
 | Quantized inference (Q4_0/Q5_0/Q8_0) | Stable | 40+ |
 | SIMD kernels (AVX2/NEON/WASM) | Stable | 15+ |
 | Streaming API | Stable | 8+ |
 | Word timestamps (monotonic peak) | Stable | 15+ |
-| ONNX model loading | Stable | 13 |
+| ONNX model loading | Stable | 28+ |
+| Speaker diarization (VAD, clustering, RTTM/DER) | Stable* | 99+ |
+
+\* Pipeline (VAD, embedding, clustering, resegmentation, RTTM/DER export) is feature-complete and stable. Producing production-accurate speaker labels requires supplying an external speaker-embedding model (e.g. ECAPA-TDNN via ONNX) — the built-in baseline embedder is intentionally low-accuracy (demo/testing only). See "Speaker Diarization" below.
 
 ## Features
 
@@ -37,6 +40,8 @@ Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 - No-repeat-ngram penalty to prevent hallucination loops
 - Compression ratio filtering for hallucination detection
 - Previous context conditioning for cross-chunk coherence
+- Translation task (`Task::Translate`) to decode any-language audio into English; default `Task::Transcribe` leaves existing callers unaffected
+- Temperature fallback decoding: retries at each temperature in `fallback_temperatures` until a non-degenerate result clears `logprob_threshold`, OpenAI-style
 
 ### Audio & Analysis
 - Pure Rust WAV loader (PCM 8/16/24/32-bit, IEEE float, multi-channel)
@@ -49,8 +54,9 @@ Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 ### API
 - `from_file(path)` — load a GGML or GGUF model from a file path (format auto-detected)
 - `from_file_mmap(path)` — memory-mapped model loading; lower peak RSS for medium/large models
-- `transcribe()`, `transcribe_segmented()`, `transcribe_timed()`
+- `transcribe()`, `transcribe_segmented()`, `transcribe_timed()`, `transcribe_words()`
 - `transcribe_long()`, `transcribe_long_segmented()`, `transcribe_long_with_vad()`
+- `transcribe_long_with_progress()`, `transcribe_long_segmented_with_progress()`, `transcribe_long_with_vad_with_progress()` — progress-reporting variants taking an `FnMut(chunk_index, total_chunks)` callback
 - `transcribe_batch()` for multiple audio clips
 - `transcribe_to_srt()`, `transcribe_to_vtt()` subtitle export
 - `stream()` returning `StreamTranscriber` for real-time processing
@@ -262,9 +268,10 @@ Audio (WAV/f32) ─→ Mel Spectrogram (OxiFFT) ─→ Encoder (Conv + Transform
 Text ←─ Tokenizer ←─ Decoder (Autoregressive + KV Cache + Beam Search)
 ```
 
-**24 modules**: types, tensor, fft, mel, mel_filters, model, quantize, linear,
-attention, encoder, decoder, beam_search, decode_utils, tokenizer, audio, vad,
-stream, subtitle, dtw, hallucination, onnx_loader, test_utils, threading, whisper_model
+**27 modules**: types, tensor, fft, mel, mel_filters, model, gguf, quantize,
+linear, attention, encoder, decoder, beam_search, decode_utils, tokenizer,
+audio, vad, diarize, stream, subtitle, dtw, word_timestamps, hallucination,
+onnx_loader, test_utils, threading, whisper_model
 
 ## Examples
 

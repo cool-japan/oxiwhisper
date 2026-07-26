@@ -446,7 +446,7 @@ impl Tensor {
 
         for i in 0..chunks {
             let offset = i * 4;
-            let x = v128_load(self.data[offset..].as_ptr() as *const v128);
+            let x = unsafe { v128_load(self.data[offset..].as_ptr() as *const v128) };
 
             // x^3
             let x2 = f32x4_mul(x, x);
@@ -475,7 +475,7 @@ impl Tensor {
             let one_plus_tanh = f32x4_add(one, tanh_vec);
             let result = f32x4_mul(half, f32x4_mul(x, one_plus_tanh));
 
-            v128_store(out[offset..].as_mut_ptr() as *mut v128, result);
+            unsafe { v128_store(out[offset..].as_mut_ptr() as *mut v128, result) };
         }
 
         // Scalar remainder
@@ -507,7 +507,7 @@ impl Tensor {
             let mut max_vec = f32x4_splat(f32::NEG_INFINITY);
             for i in 0..chunks {
                 let offset = i * 4;
-                let v = v128_load(row[offset..].as_ptr() as *const v128);
+                let v = unsafe { v128_load(row[offset..].as_ptr() as *const v128) };
                 max_vec = f32x4_max(max_vec, v);
             }
             let mut max = f32x4_extract_lane::<0>(max_vec)
@@ -530,9 +530,9 @@ impl Tensor {
             let inv_sum = f32x4_splat(1.0 / sum);
             for i in 0..chunks {
                 let offset = i * 4;
-                let v = v128_load(row[offset..].as_ptr() as *const v128);
+                let v = unsafe { v128_load(row[offset..].as_ptr() as *const v128) };
                 let result = f32x4_mul(v, inv_sum);
-                v128_store(row[offset..].as_mut_ptr() as *mut v128, result);
+                unsafe { v128_store(row[offset..].as_mut_ptr() as *mut v128, result) };
             }
             let inv_sum_scalar = 1.0 / sum;
             for i in 0..remainder {
@@ -560,7 +560,7 @@ impl Tensor {
             let mut sum_vec = f32x4_splat(0.0);
             for i in 0..chunks {
                 let offset = i * 4;
-                let v = v128_load(row[offset..].as_ptr() as *const v128);
+                let v = unsafe { v128_load(row[offset..].as_ptr() as *const v128) };
                 sum_vec = f32x4_add(sum_vec, v);
             }
             let mut sum = f32x4_extract_lane::<0>(sum_vec)
@@ -578,7 +578,7 @@ impl Tensor {
             let mut var_vec = f32x4_splat(0.0);
             for i in 0..chunks {
                 let offset = i * 4;
-                let v = v128_load(row[offset..].as_ptr() as *const v128);
+                let v = unsafe { v128_load(row[offset..].as_ptr() as *const v128) };
                 let diff = f32x4_sub(v, mean_vec);
                 var_vec = f32x4_add(var_vec, f32x4_mul(diff, diff));
             }
@@ -596,12 +596,12 @@ impl Tensor {
             let inv_std = f32x4_splat(1.0 / std);
             for i in 0..chunks {
                 let offset = i * 4;
-                let v = v128_load(row[offset..].as_ptr() as *const v128);
-                let w = v128_load(weight.data[offset..].as_ptr() as *const v128);
-                let b = v128_load(bias.data[offset..].as_ptr() as *const v128);
+                let v = unsafe { v128_load(row[offset..].as_ptr() as *const v128) };
+                let w = unsafe { v128_load(weight.data[offset..].as_ptr() as *const v128) };
+                let b = unsafe { v128_load(bias.data[offset..].as_ptr() as *const v128) };
                 let normed = f32x4_mul(f32x4_sub(v, mean_vec), inv_std);
                 let result = f32x4_add(f32x4_mul(normed, w), b);
-                v128_store(row[offset..].as_mut_ptr() as *mut v128, result);
+                unsafe { v128_store(row[offset..].as_mut_ptr() as *mut v128, result) };
             }
             for i in 0..remainder {
                 let idx = scalar_start + i;
@@ -626,10 +626,10 @@ impl Tensor {
 
         for i in 0..chunks {
             let offset = i * 4;
-            let a = v128_load(self.data[offset..].as_ptr() as *const v128);
-            let b = v128_load(other.data[offset..].as_ptr() as *const v128);
+            let a = unsafe { v128_load(self.data[offset..].as_ptr() as *const v128) };
+            let b = unsafe { v128_load(other.data[offset..].as_ptr() as *const v128) };
             let result = f32x4_add(a, b);
-            v128_store(out[offset..].as_mut_ptr() as *mut v128, result);
+            unsafe { v128_store(out[offset..].as_mut_ptr() as *mut v128, result) };
         }
 
         let scalar_start = chunks * 4;
@@ -655,10 +655,10 @@ impl Tensor {
         for row in data.chunks_mut(cols) {
             for i in 0..chunks {
                 let offset = i * 4;
-                let v = v128_load(row[offset..].as_ptr() as *const v128);
-                let b = v128_load(bias.data[offset..].as_ptr() as *const v128);
+                let v = unsafe { v128_load(row[offset..].as_ptr() as *const v128) };
+                let b = unsafe { v128_load(bias.data[offset..].as_ptr() as *const v128) };
                 let result = f32x4_add(v, b);
-                v128_store(row[offset..].as_mut_ptr() as *mut v128, result);
+                unsafe { v128_store(row[offset..].as_mut_ptr() as *mut v128, result) };
             }
             let scalar_start = chunks * 4;
             for i in 0..remainder {

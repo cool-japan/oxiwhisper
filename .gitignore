@@ -2,6 +2,10 @@
 **/target/
 **/*.rs.bk
 
+# Downloaded Whisper weights used by the env-gated real-model integration test
+# (`OXIWHISPER_TEST_MODEL`). Never committed — see tests/real_model.rs.
+/models/
+
 # Cargo files
 **/Cargo.lock
 

@@ -537,16 +537,12 @@ fn parse_line_vocab(content: &str, n_vocab: usize) -> Result<Vec<VocabEntry>, St
     let lines: Vec<&str> = content.lines().collect();
     let mut vocab = Vec::with_capacity(n_vocab);
     for line in &lines {
-        vocab.push(VocabEntry {
-            text: line.to_string(),
-        });
+        vocab.push(VocabEntry::from_text(line));
     }
     // Pad if the file has fewer entries than n_vocab.
     while vocab.len() < n_vocab {
         let idx = vocab.len();
-        vocab.push(VocabEntry {
-            text: format!("<|extra_{idx}|>"),
-        });
+        vocab.push(VocabEntry::from_text(format!("<|extra_{idx}|>")));
     }
     Ok(vocab)
 }
@@ -616,20 +612,18 @@ fn parse_tokenizer_json(content: &str, n_vocab: usize) -> Result<Vec<VocabEntry>
         .max(n_vocab);
     let mut vocab = Vec::with_capacity(actual_size);
     for _ in 0..actual_size {
-        vocab.push(VocabEntry {
-            text: String::new(),
-        });
+        vocab.push(VocabEntry::from_bytes(Vec::new()));
     }
     for (id, text) in entries {
         if id < vocab.len() {
-            vocab[id].text = text;
+            vocab[id] = VocabEntry::from_text(text);
         }
     }
 
     // Fill blanks.
     for (i, entry) in vocab.iter_mut().enumerate() {
-        if entry.text.is_empty() {
-            entry.text = format!("<|extra_{i}|>");
+        if entry.is_empty() {
+            *entry = VocabEntry::from_text(format!("<|extra_{i}|>"));
         }
     }
 
@@ -850,15 +844,13 @@ fn generate_minimal_vocab(n_vocab: usize) -> Vec<VocabEntry> {
         } else {
             format!("<|byte_{i}|>")
         };
-        vocab.push(VocabEntry { text });
+        vocab.push(VocabEntry::from_text(text));
     }
 
     // Fill 256..n_vocab with placeholders, then overwrite special tokens.
     while vocab.len() < n_vocab {
         let idx = vocab.len();
-        vocab.push(VocabEntry {
-            text: format!("<|extra_{idx}|>"),
-        });
+        vocab.push(VocabEntry::from_text(format!("<|extra_{idx}|>")));
     }
 
     // Standard Whisper special tokens.
@@ -976,7 +968,7 @@ fn generate_minimal_vocab(n_vocab: usize) -> Vec<VocabEntry> {
 
     for &(idx, text) in special_tokens {
         if idx < vocab.len() {
-            vocab[idx].text = text.to_string();
+            vocab[idx] = VocabEntry::from_text(text);
         }
     }
 
@@ -1143,14 +1135,14 @@ mod tests {
         let vocab = generate_minimal_vocab(51364);
         assert_eq!(vocab.len(), 51364);
         // Check a few byte tokens.
-        assert_eq!(vocab[33].text, "!");
-        assert_eq!(vocab[65].text, "A");
+        assert_eq!(vocab[33].text(), "!");
+        assert_eq!(vocab[65].text(), "A");
         // Check special tokens.
-        assert_eq!(vocab[50256].text, "<|endoftext|>");
-        assert_eq!(vocab[50257].text, "<|startoftranscript|>");
-        assert_eq!(vocab[50363].text, "<|notimestamps|>");
+        assert_eq!(vocab[50256].text(), "<|endoftext|>");
+        assert_eq!(vocab[50257].text(), "<|startoftranscript|>");
+        assert_eq!(vocab[50363].text(), "<|notimestamps|>");
         // Non-printable byte tokens.
-        assert_eq!(vocab[0].text, "<|byte_0|>");
+        assert_eq!(vocab[0].text(), "<|byte_0|>");
     }
 
     #[test]
@@ -1158,10 +1150,10 @@ mod tests {
         let content = "hello\nworld\nfoo";
         let vocab = parse_line_vocab(content, 5).expect("parse failed");
         assert_eq!(vocab.len(), 5);
-        assert_eq!(vocab[0].text, "hello");
-        assert_eq!(vocab[1].text, "world");
-        assert_eq!(vocab[2].text, "foo");
-        assert!(vocab[3].text.starts_with("<|extra_"));
+        assert_eq!(vocab[0].text(), "hello");
+        assert_eq!(vocab[1].text(), "world");
+        assert_eq!(vocab[2].text(), "foo");
+        assert!(vocab[3].text().starts_with("<|extra_"));
     }
 
     #[test]
@@ -1169,9 +1161,9 @@ mod tests {
         let json = r#"{"model": {"vocab": {"hello": 0, "world": 1, "foo": 2}}}"#;
         let vocab = parse_tokenizer_json(json, 5).expect("parse failed");
         assert!(vocab.len() >= 5);
-        assert_eq!(vocab[0].text, "hello");
-        assert_eq!(vocab[1].text, "world");
-        assert_eq!(vocab[2].text, "foo");
+        assert_eq!(vocab[0].text(), "hello");
+        assert_eq!(vocab[1].text(), "world");
+        assert_eq!(vocab[2].text(), "foo");
     }
 
     #[test]
@@ -1229,8 +1221,8 @@ mod tests {
         let json = r#"{"model": {"vocab": {"café": 0, "naïve": 1}}}"#;
         let vocab = parse_tokenizer_json(json, 3).expect("parse failed");
         assert!(vocab.len() >= 2, "vocab should have at least 2 entries");
-        assert_eq!(vocab[0].text, "café", "\\u00e9 must decode to é");
-        assert_eq!(vocab[1].text, "naïve", "\\u00ef must decode to ï");
+        assert_eq!(vocab[0].text(), "café", "\\u00e9 must decode to é");
+        assert_eq!(vocab[1].text(), "naïve", "\\u00ef must decode to ï");
     }
 
     #[test]

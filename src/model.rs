@@ -31,11 +31,62 @@ pub struct Hparams {
     pub ftype: i32,
 }
 
-/// Token vocabulary entry
-#[derive(Debug, Clone)]
+/// Token vocabulary entry.
+///
+/// The token payload is stored as **raw bytes**, exactly as the model file
+/// spells it. Whisper uses GPT-2 byte-level BPE, so a single multi-byte
+/// character is frequently split across several tokens: the kanji `渋`
+/// (`U+6E0B`, UTF-8 `E6 B8 8B`) is tokens `162`, `116`, `233` in the standard
+/// multilingual vocabulary, and none of those three is valid UTF-8 on its own.
+///
+/// Converting each entry to a `String` at load time therefore destroys the
+/// vocabulary (1476 of 50257 entries in `ggml-tiny.bin` become `U+FFFD`).
+/// Decoding must concatenate **bytes** and run the UTF-8 conversion exactly
+/// once over the joined buffer — see [`crate::tokenizer::decode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VocabEntry {
-    /// Decoded UTF-8 string for this token (already byte-decoded from GPT-2 BPE).
-    pub text: String,
+    /// Raw token bytes as stored in the model file.
+    pub bytes: Vec<u8>,
+}
+
+impl VocabEntry {
+    /// Build an entry from raw model-file bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// Build an entry from text that is already known to be valid UTF-8
+    /// (special tokens, ONNX/GGUF vocab strings, tests).
+    pub fn from_text(text: impl AsRef<str>) -> Self {
+        Self {
+            bytes: text.as_ref().as_bytes().to_vec(),
+        }
+    }
+
+    /// Raw bytes of this token.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Lossy UTF-8 view of this **single** entry.
+    ///
+    /// Only meaningful for entries that are complete characters (ASCII, special
+    /// tokens, whole CJK tokens). Never use this to build a transcript — join
+    /// the bytes first, then decode once.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
+
+    /// `true` when this entry is a Whisper special token, i.e. it starts with
+    /// the `<|` marker (`<|startoftranscript|>`, `<|en|>`, …).
+    pub fn is_special(&self) -> bool {
+        self.bytes.starts_with(b"<|")
+    }
+
+    /// `true` when the entry carries no bytes at all.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 /// All loaded model data
@@ -49,7 +100,8 @@ pub struct ModelData {
     pub vocab: Vec<VocabEntry>,
     /// Unquantized f32 tensors indexed by name.
     pub tensors: HashMap<String, Tensor>,
-    /// Quantized tensors kept in their original GGML format (Q4_0 / Q8_0).
+    /// Quantized tensors kept in their original GGML block format
+    /// (Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0).
     /// Large 2D weight matrices are stored here instead of being dequantized to f32.
     pub quantized_tensors: HashMap<String, crate::quantize::QuantizedTensor>,
 }
@@ -172,9 +224,10 @@ fn load_ggml_from_reader<R: Read>(reader: &mut R) -> Result<ModelData, String> {
         reader
             .read_exact(&mut buf)
             .map_err(|e| format!("read vocab: {e}"))?;
-        vocab.push(VocabEntry {
-            text: String::from_utf8_lossy(&buf).into_owned(),
-        });
+        // Store the bytes verbatim. GPT-2 byte-level BPE splits multi-byte
+        // characters across tokens, so a per-entry UTF-8 conversion here would
+        // irrecoverably replace those fragments with U+FFFD.
+        vocab.push(VocabEntry::from_bytes(buf));
     }
 
     #[cfg(feature = "timing")]
@@ -214,7 +267,12 @@ fn load_ggml_from_reader<R: Read>(reader: &mut R) -> Result<ModelData, String> {
         // Determine if this is a large 2D weight suitable for quantized storage
         let is_large_2d_weight = n_dims == 2 && n_elements > 1024;
 
-        // Read data based on dtype (GGML format dtype IDs)
+        // Read data based on dtype.
+        //
+        // The legacy GGML whisper container stores the *same* `ggml_type`
+        // discriminants as GGUF:
+        //   0 = F32, 1 = F16, 2 = Q4_0, 3 = Q4_1, 6 = Q5_0, 7 = Q5_1, 8 = Q8_0
+        // (4/5 are the removed Q4_2/Q4_3, 9 = Q8_1, 10+ = K-quants).
         match dtype {
             0 => {
                 // f32
@@ -239,95 +297,28 @@ fn load_ggml_from_reader<R: Read>(reader: &mut R) -> Result<ModelData, String> {
                 let tensor = Tensor::from_vec(f32_data, &shape);
                 tensors.insert(name.clone(), tensor);
             }
-            2 => {
-                // Q4_0: 4-bit quantized (GGML dtype 2)
-                use crate::quantize::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE};
-                let n_blocks = n_elements / Q4_0_BLOCK_SIZE;
-                let n_bytes = n_blocks * Q4_0_BLOCK_BYTES;
-                let mut raw = vec![0u8; n_bytes];
-                reader
-                    .read_exact(&mut raw)
-                    .map_err(|e| format!("read Q4_0 data: {e}"))?;
-
-                if is_large_2d_weight {
-                    quantized_tensors.insert(
-                        name.clone(),
-                        crate::quantize::QuantizedTensor {
-                            raw,
-                            shape,
-                            qtype: crate::quantize::QuantType::Q4_0,
-                        },
-                    );
-                    #[cfg(feature = "timing")]
-                    {
-                        quant_count += 1;
+            other => {
+                let qtype =
+                    crate::quantize::QuantType::from_ggml_type(other as u32).ok_or_else(|| {
+                        format!(
+                            "Unsupported tensor dtype: {dtype} for {name}; \
+                             supported GGML types are F32(0), F16(1), Q4_0(2), Q4_1(3), \
+                             Q5_0(6), Q5_1(7) and Q8_0(8)"
+                        )
+                    })?;
+                let loaded = read_ggml_quantized(reader, qtype, &name, shape, is_large_2d_weight)?;
+                match loaded {
+                    LoadedTensor::Float(t) => {
+                        tensors.insert(name.clone(), t);
                     }
-                } else {
-                    let f32_data = crate::quantize::dequantize_q4_0(&raw, n_elements);
-                    let tensor = Tensor::from_vec(f32_data, &shape);
-                    tensors.insert(name.clone(), tensor);
-                }
-            }
-            3 => {
-                // Q8_0: 8-bit quantized (GGML dtype 3)
-                use crate::quantize::{Q8_0_BLOCK_BYTES, Q8_0_BLOCK_SIZE};
-                let n_blocks = n_elements / Q8_0_BLOCK_SIZE;
-                let n_bytes = n_blocks * Q8_0_BLOCK_BYTES;
-                let mut raw = vec![0u8; n_bytes];
-                reader
-                    .read_exact(&mut raw)
-                    .map_err(|e| format!("read Q8_0 data: {e}"))?;
-
-                if is_large_2d_weight {
-                    quantized_tensors.insert(
-                        name.clone(),
-                        crate::quantize::QuantizedTensor {
-                            raw,
-                            shape,
-                            qtype: crate::quantize::QuantType::Q8_0,
-                        },
-                    );
-                    #[cfg(feature = "timing")]
-                    {
-                        quant_count += 1;
+                    LoadedTensor::Quantized(q) => {
+                        quantized_tensors.insert(name.clone(), q);
+                        #[cfg(feature = "timing")]
+                        {
+                            quant_count += 1;
+                        }
                     }
-                } else {
-                    let f32_data = crate::quantize::dequantize_q8_0(&raw, n_elements);
-                    let tensor = Tensor::from_vec(f32_data, &shape);
-                    tensors.insert(name.clone(), tensor);
                 }
-            }
-            6 => {
-                // Q5_0: 5-bit quantized (GGML dtype 6)
-                use crate::quantize::{Q5_0_BLOCK_BYTES, Q5_0_BLOCK_SIZE};
-                let n_blocks = n_elements / Q5_0_BLOCK_SIZE;
-                let n_bytes = n_blocks * Q5_0_BLOCK_BYTES;
-                let mut raw = vec![0u8; n_bytes];
-                reader
-                    .read_exact(&mut raw)
-                    .map_err(|e| format!("read Q5_0 data: {e}"))?;
-
-                if is_large_2d_weight {
-                    quantized_tensors.insert(
-                        name.clone(),
-                        crate::quantize::QuantizedTensor {
-                            raw,
-                            shape,
-                            qtype: crate::quantize::QuantType::Q5_0,
-                        },
-                    );
-                    #[cfg(feature = "timing")]
-                    {
-                        quant_count += 1;
-                    }
-                } else {
-                    let f32_data = crate::quantize::dequantize_q5_0(&raw, n_elements);
-                    let tensor = Tensor::from_vec(f32_data, &shape);
-                    tensors.insert(name.clone(), tensor);
-                }
-            }
-            _ => {
-                return Err(format!("Unsupported tensor dtype: {dtype} for {name}"));
             }
         }
 
@@ -350,6 +341,56 @@ fn load_ggml_from_reader<R: Read>(reader: &mut R) -> Result<ModelData, String> {
         tensors,
         quantized_tensors,
     })
+}
+
+/// Outcome of reading one block-quantized GGML tensor body.
+enum LoadedTensor {
+    /// Dequantized to f32 (small tensors and non-2-D tensors).
+    Float(Tensor),
+    /// Kept in its native quantized layout (large 2-D weight matrices).
+    Quantized(crate::quantize::QuantizedTensor),
+}
+
+/// Read the body of a block-quantized GGML tensor.
+///
+/// Large 2-D weight matrices (`keep_quantized`) are retained in their native
+/// block layout so the GEMV kernels can consume them directly; everything else
+/// is dequantized to f32 up front.
+fn read_ggml_quantized<R: Read>(
+    reader: &mut R,
+    qtype: crate::quantize::QuantType,
+    name: &str,
+    shape: Vec<usize>,
+    keep_quantized: bool,
+) -> Result<LoadedTensor, String> {
+    let n_elements: usize = shape.iter().product();
+    let block_size = qtype.block_size();
+    if block_size == 0 || !n_elements.is_multiple_of(block_size) {
+        return Err(format!(
+            "Tensor {name} has {n_elements} elements, not a multiple of the {} block size {block_size}",
+            qtype.name()
+        ));
+    }
+    let n_blocks = n_elements / block_size;
+    let n_bytes = n_blocks
+        .checked_mul(qtype.block_bytes())
+        .ok_or_else(|| format!("Tensor {name} byte size overflows usize"))?;
+
+    let mut raw = vec![0u8; n_bytes];
+    reader
+        .read_exact(&mut raw)
+        .map_err(|e| format!("read {} data for {name}: {e}", qtype.name()))?;
+
+    if keep_quantized {
+        Ok(LoadedTensor::Quantized(crate::quantize::QuantizedTensor {
+            raw,
+            shape,
+            qtype,
+        }))
+    } else {
+        let f32_data = crate::quantize::dequantize(&raw, n_elements, qtype);
+        Ok(LoadedTensor::Float(Tensor::from_vec(f32_data, &shape)))
+    }
 }
 
 fn read_i32<R: Read>(reader: &mut R) -> Result<i32, String> {
@@ -690,7 +731,10 @@ mod tests {
         use crate::test_utils::{SyntheticSpec, generate_synthetic_gguf};
         use std::io::Cursor;
 
-        // Generate a valid GGUF, then patch one tensor's dtype field to Q4_1 (unsupported).
+        // Generate a valid GGUF, then patch one tensor's dtype field to Q8_1
+        // (`ggml_type` 9) — a real ggml type that this crate deliberately does
+        // not implement, so it must be rejected with a clear message rather
+        // than silently mis-decoded.
         //
         // `encoder.conv1.weight` is a 3-dim F16 tensor (GgmlType::F16 = 1).
         // Its tensor-info layout (after the u64 name-length prefix + name bytes):
@@ -698,7 +742,7 @@ mod tests {
         //   dim[0]:    u64  (8 bytes)
         //   dim[1]:    u64  (8 bytes)
         //   dim[2]:    u64  (8 bytes)
-        //   ggml_type: u32  (4 bytes) ← patch this from F16=1 to Q4_1=3
+        //   ggml_type: u32  (4 bytes) ← patch this from F16=1 to Q8_1=9
         //   offset:    u64  (8 bytes)
         //
         // We scan for the name bytes and jump `4 + 3*8` bytes past the end to reach ggml_type.
@@ -710,8 +754,8 @@ mod tests {
         let offset_from_name_end = 4 + 3 * 8usize;
         // F16 ggml_type stored as LE u32 = [0x01, 0x00, 0x00, 0x00]
         let ggml_type_f16_le = [1u8, 0, 0, 0];
-        // Q4_1 ggml_type stored as LE u32 = [0x03, 0x00, 0x00, 0x00]
-        let q4_1_le = [3u8, 0, 0, 0];
+        // Q8_1 ggml_type stored as LE u32 = [0x09, 0x00, 0x00, 0x00]
+        let q8_1_le = [9u8, 0, 0, 0];
 
         let mut patched = false;
         let search_end = bytes
@@ -723,7 +767,7 @@ mod tests {
                 if dtype_pos + 4 <= bytes.len()
                     && bytes[dtype_pos..dtype_pos + 4] == ggml_type_f16_le
                 {
-                    bytes[dtype_pos..dtype_pos + 4].copy_from_slice(&q4_1_le);
+                    bytes[dtype_pos..dtype_pos + 4].copy_from_slice(&q8_1_le);
                     patched = true;
                     break;
                 }
@@ -736,12 +780,12 @@ mod tests {
 
         let mut cursor = Cursor::new(bytes);
         let result = ModelData::load_from_reader(&mut cursor);
-        assert!(result.is_err(), "Q4_1 should be rejected as unsupported");
+        assert!(result.is_err(), "Q8_1 should be rejected as unsupported");
         let err = result.expect_err("expected error");
         let err_lower = err.to_lowercase();
         assert!(
-            err_lower.contains("q4_1") || err_lower.contains("unsupported"),
-            "error should mention Q4_1 or unsupported, got: {err}"
+            err_lower.contains("q8_1") || err_lower.contains("unsupported"),
+            "error should mention Q8_1 or unsupported, got: {err}"
         );
     }
 

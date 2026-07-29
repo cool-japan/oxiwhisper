@@ -128,10 +128,7 @@ fn load_tensors<R: Read + Seek>(
     infos: &[TensorInfo],
     data_base: u64,
 ) -> Result<TensorMaps, OxiWhisperError> {
-    use crate::quantize::{
-        Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES,
-        Q8_0_BLOCK_SIZE, QuantType, QuantizedTensor,
-    };
+    use crate::quantize::{QuantType, QuantizedTensor};
     use crate::tensor::Tensor;
 
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
@@ -208,9 +205,28 @@ fn load_tensors<R: Read + Seek>(
                 tensors.insert(info.name.clone(), Tensor::from_vec(data, &shape));
             }
 
-            GgmlType::Q4_0 => {
-                let n_blocks = n_elements / Q4_0_BLOCK_SIZE;
-                let n_bytes = n_blocks.checked_mul(Q4_0_BLOCK_BYTES).ok_or_else(|| {
+            other => {
+                // Everything that is not F32/F16 is a block-quantized type. The
+                // `ggml_type` discriminants are shared between GGUF and the
+                // legacy GGML container, so one table serves both loaders.
+                let qtype = QuantType::from_ggml_type(other as u32).ok_or_else(|| {
+                    OxiWhisperError::InvalidModel(format!(
+                        "Unsupported GGUF dtype {other:?} for tensor '{}'; \
+                         supported: F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0",
+                        info.name
+                    ))
+                })?;
+                let block_size = qtype.block_size();
+                if !n_elements.is_multiple_of(block_size) {
+                    return Err(OxiWhisperError::InvalidModel(format!(
+                        "Tensor '{}' has {n_elements} elements, not a multiple of the {} \
+                         block size {block_size}",
+                        info.name,
+                        qtype.name()
+                    )));
+                }
+                let n_blocks = n_elements / block_size;
+                let n_bytes = n_blocks.checked_mul(qtype.block_bytes()).ok_or_else(|| {
                     OxiWhisperError::InvalidModel(format!(
                         "Tensor '{}' byte size overflows usize",
                         info.name
@@ -221,97 +237,12 @@ fn load_tensors<R: Read + Seek>(
                 reader.read_exact(&mut raw).map_err(OxiWhisperError::Io)?;
 
                 if is_large_2d {
-                    quantized_tensors.insert(
-                        info.name.clone(),
-                        QuantizedTensor {
-                            raw,
-                            shape,
-                            qtype: QuantType::Q4_0,
-                        },
-                    );
+                    quantized_tensors
+                        .insert(info.name.clone(), QuantizedTensor { raw, shape, qtype });
                 } else {
-                    let data = crate::quantize::dequantize_q4_0(&raw, n_elements);
+                    let data = crate::quantize::dequantize(&raw, n_elements, qtype);
                     tensors.insert(info.name.clone(), Tensor::from_vec(data, &shape));
                 }
-            }
-
-            GgmlType::Q4_1 => {
-                // Q4_1 is recognised but not supported for inference — reject.
-                return Err(OxiWhisperError::InvalidModel(format!(
-                    "Unsupported GGUF dtype Q4_1 for tensor '{}'; \
-                     only Q4_0, Q5_0, and Q8_0 are supported",
-                    info.name
-                )));
-            }
-
-            GgmlType::Q5_0 => {
-                let n_blocks = n_elements / Q5_0_BLOCK_SIZE;
-                let n_bytes = n_blocks.checked_mul(Q5_0_BLOCK_BYTES).ok_or_else(|| {
-                    OxiWhisperError::InvalidModel(format!(
-                        "Tensor '{}' byte size overflows usize",
-                        info.name
-                    ))
-                })?;
-                ensure_tensor_data_fits(&info.name, abs_offset, n_bytes as u64, stream_len)?;
-                let mut raw = vec![0u8; n_bytes];
-                reader.read_exact(&mut raw).map_err(OxiWhisperError::Io)?;
-
-                if is_large_2d {
-                    quantized_tensors.insert(
-                        info.name.clone(),
-                        QuantizedTensor {
-                            raw,
-                            shape,
-                            qtype: QuantType::Q5_0,
-                        },
-                    );
-                } else {
-                    let data = crate::quantize::dequantize_q5_0(&raw, n_elements);
-                    tensors.insert(info.name.clone(), Tensor::from_vec(data, &shape));
-                }
-            }
-
-            GgmlType::Q5_1 => {
-                return Err(OxiWhisperError::InvalidModel(format!(
-                    "Unsupported GGUF dtype Q5_1 for tensor '{}'; \
-                     only Q4_0, Q5_0, and Q8_0 are supported",
-                    info.name
-                )));
-            }
-
-            GgmlType::Q8_0 => {
-                let n_blocks = n_elements / Q8_0_BLOCK_SIZE;
-                let n_bytes = n_blocks.checked_mul(Q8_0_BLOCK_BYTES).ok_or_else(|| {
-                    OxiWhisperError::InvalidModel(format!(
-                        "Tensor '{}' byte size overflows usize",
-                        info.name
-                    ))
-                })?;
-                ensure_tensor_data_fits(&info.name, abs_offset, n_bytes as u64, stream_len)?;
-                let mut raw = vec![0u8; n_bytes];
-                reader.read_exact(&mut raw).map_err(OxiWhisperError::Io)?;
-
-                if is_large_2d {
-                    quantized_tensors.insert(
-                        info.name.clone(),
-                        QuantizedTensor {
-                            raw,
-                            shape,
-                            qtype: QuantType::Q8_0,
-                        },
-                    );
-                } else {
-                    let data = crate::quantize::dequantize_q8_0(&raw, n_elements);
-                    tensors.insert(info.name.clone(), Tensor::from_vec(data, &shape));
-                }
-            }
-
-            GgmlType::Q8_1 => {
-                return Err(OxiWhisperError::InvalidModel(format!(
-                    "Unsupported GGUF dtype Q8_1 for tensor '{}'; \
-                     only Q4_0, Q5_0, and Q8_0 are supported",
-                    info.name
-                )));
             }
         }
     }

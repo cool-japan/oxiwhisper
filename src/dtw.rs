@@ -418,45 +418,116 @@ pub fn align_tokens_dtw(
 /// `token_texts`: decoded text for each token
 /// `token_times`: (start, end) time for each token from monotonic-peak alignment
 /// `token_probs`: log-probability for each token
+///
+/// Convenience wrapper over [`build_word_segments_bytes`] for callers that
+/// already hold valid UTF-8 per token. Whisper's byte-level BPE frequently
+/// splits a character across tokens, so the inference pipeline uses the byte
+/// variant instead.
 pub fn build_word_segments(
     token_texts: &[String],
     token_times: &[(f32, f32)],
     token_probs: &[f32],
 ) -> Vec<WordSegment> {
-    if token_texts.is_empty() {
+    let bytes: Vec<Vec<u8>> = token_texts.iter().map(|t| t.as_bytes().to_vec()).collect();
+    build_word_segments_bytes(&bytes, token_times, token_probs)
+}
+
+/// `true` when `b` is the first byte of a UTF-8 scalar value (i.e. not a
+/// `10xxxxxx` continuation byte).
+#[inline]
+fn is_utf8_char_start(b: u8) -> bool {
+    (b & 0xC0) != 0x80
+}
+
+/// Trim leading/trailing ASCII whitespace from a byte slice.
+#[inline]
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+/// Build word segments from **raw per-token bytes**.
+///
+/// Two segmentation modes are used, selected automatically:
+///
+/// * **Space-delimited scripts** (any token starts with an ASCII space):
+///   a new word starts at every leading-space token, matching Whisper's
+///   sentencepiece-style spacing.
+/// * **Scripts without inter-word spaces** (Japanese, Chinese, Thai, …): no
+///   token ever carries a leading space, so grouping on spaces alone would
+///   collapse the whole utterance into a single "word". In that case a new
+///   word starts at every *character* boundary — a token may only open a word
+///   when the bytes accumulated so far form complete UTF-8 and the token
+///   itself begins a new scalar value. That keeps multi-token characters
+///   (`渋` = tokens 162/116/233) intact while still producing one word per
+///   character.
+pub fn build_word_segments_bytes(
+    token_bytes: &[Vec<u8>],
+    token_times: &[(f32, f32)],
+    token_probs: &[f32],
+) -> Vec<WordSegment> {
+    if token_bytes.is_empty() {
         return Vec::new();
     }
 
-    let mut segments = Vec::new();
-    let mut current_word = String::new();
-    let mut word_start = 0.0f32;
-    let mut word_probs = Vec::new();
+    let space_delimited = token_bytes.iter().any(|t| t.starts_with(b" "));
 
-    for (i, text) in token_texts.iter().enumerate() {
-        let trimmed = text.trim();
+    let mut segments = Vec::new();
+    let mut current_word: Vec<u8> = Vec::new();
+    let mut word_start = 0.0f32;
+    let mut word_probs: Vec<f32> = Vec::new();
+
+    let flush = |word: &mut Vec<u8>,
+                 probs: &mut Vec<f32>,
+                 start: f32,
+                 end: f32,
+                 out: &mut Vec<WordSegment>| {
+        if word.is_empty() {
+            return;
+        }
+        let avg_prob = if probs.is_empty() {
+            0.0
+        } else {
+            probs.iter().sum::<f32>() / probs.len() as f32
+        };
+        out.push(WordSegment {
+            word: String::from_utf8_lossy(trim_ascii(word)).into_owned(),
+            start,
+            end,
+            confidence: avg_prob,
+        });
+        word.clear();
+        probs.clear();
+    };
+
+    for (i, raw) in token_bytes.iter().enumerate() {
+        let trimmed = trim_ascii(raw);
         if trimmed.is_empty() {
             continue;
         }
 
-        // Check if this token starts a new word (starts with space or is first).
-        let starts_new_word = text.starts_with(' ') || (i == 0 && !text.is_empty());
+        let starts_new_word = raw.starts_with(b" ")
+            || (!space_delimited
+                && is_utf8_char_start(trimmed[0])
+                && std::str::from_utf8(&current_word).is_ok());
 
         if starts_new_word && !current_word.is_empty() {
-            // Flush previous word.
-            let avg_prob = if word_probs.is_empty() {
-                0.0
-            } else {
-                word_probs.iter().sum::<f32>() / word_probs.len() as f32
-            };
             let end = token_times.get(i).map(|t| t.0).unwrap_or(word_start);
-            segments.push(WordSegment {
-                word: current_word.trim().to_string(),
-                start: word_start,
+            flush(
+                &mut current_word,
+                &mut word_probs,
+                word_start,
                 end,
-                confidence: avg_prob,
-            });
-            current_word.clear();
-            word_probs.clear();
+                &mut segments,
+            );
             word_start = token_times.get(i).map(|t| t.0).unwrap_or(0.0);
         }
 
@@ -464,27 +535,21 @@ pub fn build_word_segments(
             word_start = token_times.get(i).map(|t| t.0).unwrap_or(0.0);
         }
 
-        current_word.push_str(trimmed);
+        current_word.extend_from_slice(trimmed);
         if i < token_probs.len() {
             word_probs.push(token_probs[i]);
         }
     }
 
     // Flush last word.
-    if !current_word.is_empty() {
-        let avg_prob = if word_probs.is_empty() {
-            0.0
-        } else {
-            word_probs.iter().sum::<f32>() / word_probs.len() as f32
-        };
-        let end = token_times.last().map(|t| t.1).unwrap_or(word_start);
-        segments.push(WordSegment {
-            word: current_word.trim().to_string(),
-            start: word_start,
-            end,
-            confidence: avg_prob,
-        });
-    }
+    let end = token_times.last().map(|t| t.1).unwrap_or(word_start);
+    flush(
+        &mut current_word,
+        &mut word_probs,
+        word_start,
+        end,
+        &mut segments,
+    );
 
     segments
 }

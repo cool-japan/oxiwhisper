@@ -278,7 +278,7 @@ fn decode_with_dtype(
     use oxiwhisper::tensor::Tensor;
     use oxiwhisper::{TranscribeOptions, decoder, encoder, mel};
 
-    let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters);
+    let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters).expect("mel");
     let n_mels = md.hparams.n_mels;
     let n_frames = mel_data.len() / n_mels;
     let mel = Tensor::from_vec(mel_data, &[n_mels, n_frames]);

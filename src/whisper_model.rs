@@ -159,7 +159,7 @@ impl WhisperModel {
 
         // Reuse mel_buf: clear and refill
         buffer.mel_buf.clear();
-        let mel_fresh = mel::log_mel_spectrogram(audio, &md.mel_filters);
+        let mel_fresh = mel::log_mel_spectrogram(audio, &md.mel_filters)?;
         buffer.mel_buf.extend_from_slice(&mel_fresh);
 
         let n_mels = md.hparams.n_mels;
@@ -220,7 +220,7 @@ impl WhisperModel {
         #[cfg(feature = "timing")]
         let t0 = std::time::Instant::now();
 
-        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters);
+        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters)?;
         let n_mels = md.hparams.n_mels;
         let n_frames = mel_data.len() / n_mels;
         let mel = tensor::Tensor::from_vec(mel_data, &[n_mels, n_frames]);
@@ -296,7 +296,7 @@ impl WhisperModel {
 
         // --- Mel spectrogram ---
         let t_mel_start = std::time::Instant::now();
-        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters);
+        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters)?;
         let n_mels = md.hparams.n_mels;
         let n_frames = mel_data.len() / n_mels;
         let mel = tensor::Tensor::from_vec(mel_data, &[n_mels, n_frames]);
@@ -608,7 +608,7 @@ impl WhisperModel {
         #[cfg(feature = "timing")]
         let t0 = std::time::Instant::now();
 
-        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters);
+        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters)?;
         let n_mels = md.hparams.n_mels;
         let n_frames = mel_data.len() / n_mels;
         let mel = tensor::Tensor::from_vec(mel_data, &[n_mels, n_frames]);
@@ -756,7 +756,11 @@ impl WhisperModel {
             return Err(OxiWhisperError::InferenceFailed("Empty audio".into()));
         }
         let md = &self.model_data;
-        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters);
+        // Deliberately uses the *unpadded* front-end: embedding extraction wants
+        // one encoder frame per 20 ms of real audio, not 30 s of mostly silence.
+        // Transcription paths use `mel::log_mel_spectrogram`, which pads to the
+        // full window the encoder was trained on.
+        let mel_data = mel::log_mel_spectrogram_unpadded(audio, &md.mel_filters)?;
         let n_mels = md.hparams.n_mels;
         let n_frames = mel_data.len() / n_mels;
         let mel_tensor = tensor::Tensor::from_vec(mel_data, &[n_mels, n_frames]);
@@ -765,14 +769,21 @@ impl WhisperModel {
 
     /// Compute the log-mel spectrogram for the given audio.
     ///
-    /// Returns a tensor of shape `[n_mels, n_frames]`. Useful for audio analysis,
-    /// visualization, or reusing the mel computation across multiple inference runs.
-    pub fn mel_spectrogram(&self, audio: &[f32]) -> tensor::Tensor {
+    /// Returns a tensor of shape `[n_mels, 3000]` — the canonical Whisper
+    /// window, zero-padded exactly as the transcription path sees it. Useful for
+    /// audio analysis, visualization, or reusing the mel computation across
+    /// multiple inference runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiWhisperError::InvalidModel`] when the model's mel filter
+    /// bank does not describe a whole number of channels.
+    pub fn mel_spectrogram(&self, audio: &[f32]) -> Result<tensor::Tensor, OxiWhisperError> {
         let md = &self.model_data;
-        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters);
+        let mel_data = mel::log_mel_spectrogram(audio, &md.mel_filters)?;
         let n_mels = md.hparams.n_mels;
         let n_frames = mel_data.len() / n_mels;
-        tensor::Tensor::from_vec(mel_data, &[n_mels, n_frames])
+        Ok(tensor::Tensor::from_vec(mel_data, &[n_mels, n_frames]))
     }
 
     /// Return statistics about the loaded model.
@@ -1407,7 +1418,7 @@ mod tests {
         let audio = vec![0.0f32; 16000];
         let n_bins = mel::WHISPER_N_FFT / 2 + 1;
         let mel_filters = vec![1.0f32 / n_bins as f32; mel::WHISPER_N_MELS * n_bins];
-        let result = mel::log_mel_spectrogram(&audio, &mel_filters);
+        let result = mel::log_mel_spectrogram(&audio, &mel_filters).expect("mel");
         for (i, &v) in result.iter().enumerate() {
             assert!(v.is_finite(), "non-finite at index {i}: {v}");
         }
@@ -1670,11 +1681,15 @@ mod tests {
         let audio: Vec<f32> = (0..16000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5)
             .collect();
-        let mel_tensor = model.mel_spectrogram(&audio);
+        let mel_tensor = model.mel_spectrogram(&audio).expect("mel_spectrogram");
         assert_eq!(mel_tensor.shape.len(), 2, "mel should be 2D");
         assert_eq!(mel_tensor.shape[0], 80, "first dim should be n_mels=80");
         let n_frames = mel_tensor.shape[1];
-        assert!(n_frames > 0, "should have at least 1 frame");
+        assert_eq!(
+            n_frames,
+            mel::WHISPER_N_FRAMES,
+            "the transcription front-end always covers the full 30 s window"
+        );
         assert_eq!(
             mel_tensor.data.len(),
             80 * n_frames,
@@ -1690,7 +1705,7 @@ mod tests {
         let audio: Vec<f32> = (0..16000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5)
             .collect();
-        let mel_tensor = model.mel_spectrogram(&audio);
+        let mel_tensor = model.mel_spectrogram(&audio).expect("mel_spectrogram");
         for (i, &v) in mel_tensor.data.iter().enumerate() {
             assert!(
                 v.is_finite(),

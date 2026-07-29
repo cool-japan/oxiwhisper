@@ -1,13 +1,20 @@
 //! Pure vocab pass-through decoding for Whisper's BPE token vocabulary.
 //!
 //! This module performs **pure vocab pass-through decoding** — there is no
-//! `encode()` function and no merge table. Whisper's GPT-2 byte-level decoding
-//! is performed once at GGML load time (see `model::ModelData::load`), so by
-//! the time `decode` runs, every `VocabEntry::text` is already valid UTF-8.
-//! oxiwhisper is inference-only.
+//! `encode()` function and no merge table. oxiwhisper is inference-only.
+//!
+//! # Byte-level decoding
+//!
+//! Whisper uses GPT-2 byte-level BPE: a single multi-byte character is often
+//! spelled by several tokens, none of which is valid UTF-8 on its own (the
+//! kanji `渋` = `U+6E0B` = `E6 B8 8B` is tokens `162`, `116`, `233`). Every
+//! function here therefore concatenates the **raw bytes** of the selected
+//! entries and performs a single lossy UTF-8 conversion over the joined
+//! buffer. Converting per entry would replace 1476 of the 50257 entries in the
+//! standard multilingual vocabulary with `U+FFFD`.
 //!
 //! # Elision rules
-//! - **Special tokens** whose `text` begins with `"<|"` are silently dropped.
+//! - **Special tokens** whose bytes begin with `"<|"` are silently dropped.
 //! - **Out-of-range token IDs** (`id >= vocab.len()`) are silently dropped.
 //!
 //! Neither elision produces an error — this is intentional for robustness
@@ -107,26 +114,49 @@ impl SpecialTokens {
     }
 }
 
+/// Append the raw bytes of every non-special, in-range token to `out`.
+///
+/// This is the shared primitive behind [`decode`] and [`parse_segments`]: it
+/// never converts to UTF-8, so multi-token characters survive intact.
+pub fn decode_bytes_into(token_ids: &[u32], vocab: &[VocabEntry], out: &mut Vec<u8>) {
+    for &id in token_ids {
+        let Some(entry) = vocab.get(id as usize) else {
+            continue;
+        };
+        if entry.is_special() {
+            continue;
+        }
+        out.extend_from_slice(entry.as_bytes());
+    }
+}
+
+/// Decode Whisper token IDs to their raw byte sequence.
+///
+/// The result is the byte-exact concatenation of every non-special token,
+/// before any UTF-8 interpretation. Useful when a caller needs to splice
+/// decoder outputs together (streaming, segment stitching) without risking a
+/// mid-character UTF-8 conversion.
+pub fn decode_bytes(token_ids: &[u32], vocab: &[VocabEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(token_ids.len() * 3);
+    decode_bytes_into(token_ids, vocab, &mut out);
+    out
+}
+
 /// Decode Whisper token IDs to a UTF-8 string.
 ///
-/// GGML stores each token's text as raw UTF-8 (already decoded from GPT-2 byte encoding).
-/// We simply concatenate the text of all non-special tokens.
+/// The bytes of all non-special tokens are concatenated first and converted
+/// **once** with [`String::from_utf8_lossy`]. Doing the conversion per token
+/// would corrupt every character whose UTF-8 encoding spans more than one BPE
+/// token (all kanji, kana, hangul, emoji, …).
 pub fn decode(token_ids: &[u32], vocab: &[VocabEntry]) -> String {
-    let mut result = String::with_capacity(token_ids.len() * 3);
+    let bytes = decode_bytes(token_ids, vocab);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
-    for &id in token_ids {
-        let idx = id as usize;
-        if idx >= vocab.len() {
-            continue;
-        }
-        let text = &vocab[idx].text;
-        if text.starts_with("<|") {
-            continue;
-        }
-        result.push_str(text);
-    }
-
-    result
+/// Convert a raw byte buffer to a trimmed `String` with a single lossy UTF-8
+/// conversion.
+fn finish_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
 }
 
 /// Parse a sequence of token IDs (which may contain timestamp tokens) into text segments.
@@ -138,7 +168,9 @@ pub fn decode(token_ids: &[u32], vocab: &[VocabEntry]) -> String {
 pub fn parse_segments(token_ids: &[u32], vocab: &[VocabEntry]) -> Vec<(f32, f32, String)> {
     let mut segments: Vec<(f32, f32, String)> = Vec::new();
     let mut current_start: Option<f32> = None;
-    let mut current_text = String::new();
+    // Text is accumulated as raw bytes and converted once per segment so that
+    // characters spanning several BPE tokens survive.
+    let mut current_bytes: Vec<u8> = Vec::new();
     let mut found_any_timestamp = false;
 
     for &id in token_ids {
@@ -150,46 +182,44 @@ pub fn parse_segments(token_ids: &[u32], vocab: &[VocabEntry]) -> Vec<(f32, f32,
                 None => {
                     // Opening timestamp -- start a new segment
                     current_start = Some(time);
-                    current_text.clear();
+                    current_bytes.clear();
                 }
                 Some(start) => {
                     // Closing timestamp -- finalize segment
-                    let trimmed = current_text.trim().to_string();
-                    if !trimmed.is_empty() {
-                        segments.push((start, time, trimmed));
+                    let text = finish_text(&current_bytes);
+                    if !text.is_empty() {
+                        segments.push((start, time, text));
                     }
                     // This closing timestamp may also be the opening of the next segment
                     current_start = Some(time);
-                    current_text.clear();
+                    current_bytes.clear();
                 }
             }
         } else {
             // Regular text token
-            let idx = id as usize;
-            if idx < vocab.len() {
-                let text = &vocab[idx].text;
-                if !text.starts_with("<|") {
-                    current_text.push_str(text);
-                }
+            if let Some(entry) = vocab.get(id as usize)
+                && !entry.is_special()
+            {
+                current_bytes.extend_from_slice(entry.as_bytes());
             }
         }
     }
 
     // If no timestamps found at all, return the full decoded text as one segment
     if !found_any_timestamp {
-        let full_text = decode(token_ids, vocab);
-        let trimmed = full_text.trim().to_string();
-        if !trimmed.is_empty() {
-            return vec![(0.0, 0.0, trimmed)];
+        let full = decode_bytes(token_ids, vocab);
+        let text = finish_text(&full);
+        if !text.is_empty() {
+            return vec![(0.0, 0.0, text)];
         }
         return Vec::new();
     }
 
     // If there is leftover text after the last timestamp, include it
     if let Some(start) = current_start {
-        let trimmed = current_text.trim().to_string();
-        if !trimmed.is_empty() {
-            segments.push((start, 0.0, trimmed));
+        let text = finish_text(&current_bytes);
+        if !text.is_empty() {
+            segments.push((start, 0.0, text));
         }
     }
 
@@ -201,9 +231,68 @@ mod tests {
     use super::*;
 
     fn make_entry(text: &str) -> VocabEntry {
-        VocabEntry {
-            text: text.to_string(),
+        VocabEntry::from_text(text)
+    }
+
+    /// Build a vocabulary in which the token ids used by the real GGML
+    /// multilingual vocabulary for single raw bytes carry exactly that byte.
+    ///
+    /// Verified against `ggml-tiny.bin`: ids 162/116/233 hold `0xE6`, `0xB8`
+    /// and `0x8B`, the three bytes of `渋` (U+6E0B).
+    fn byte_fallback_vocab() -> Vec<VocabEntry> {
+        let mut vocab = vec![VocabEntry::from_bytes(Vec::new()); 256];
+        vocab[162] = VocabEntry::from_bytes(vec![0xE6]);
+        vocab[116] = VocabEntry::from_bytes(vec![0xB8]);
+        vocab[233] = VocabEntry::from_bytes(vec![0x8B]);
+        vocab
+    }
+
+    #[test]
+    fn test_decode_multi_token_kanji_from_raw_bytes() {
+        // Regression: the vocabulary used to be converted with
+        // `String::from_utf8_lossy` per entry at load time, which turned each
+        // of these three byte fragments into U+FFFD and made every kanji in
+        // the transcript unrecoverable.
+        let vocab = byte_fallback_vocab();
+        let decoded = decode(&[162, 116, 233], &vocab);
+        assert_eq!(decoded, "\u{6E0B}", "BPE bytes E6 B8 8B must decode to 渋");
+        assert_eq!(decoded.chars().count(), 1);
+        assert!(
+            !decoded.contains('\u{FFFD}'),
+            "no replacement characters may appear, got {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_bytes_is_byte_exact() {
+        let vocab = byte_fallback_vocab();
+        assert_eq!(
+            decode_bytes(&[162, 116, 233], &vocab),
+            vec![0xE6, 0xB8, 0x8B]
+        );
+    }
+
+    #[test]
+    fn test_parse_segments_multi_token_kanji() {
+        // <|0.00|> 渋 <|1.00|> — the segment text must be the joined kanji.
+        let vocab = byte_fallback_vocab();
+        let tokens = vec![50364u32, 162, 116, 233, 50414];
+        let segments = parse_segments(&tokens, &vocab);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].2, "\u{6E0B}");
+    }
+
+    #[test]
+    fn test_decode_japanese_sentence_split_across_byte_tokens() {
+        // こんにちは spelled entirely as single-byte fallback tokens.
+        let text = "こんにちは";
+        let mut vocab = Vec::new();
+        let mut ids = Vec::new();
+        for (i, b) in text.as_bytes().iter().enumerate() {
+            vocab.push(VocabEntry::from_bytes(vec![*b]));
+            ids.push(i as u32);
         }
+        assert_eq!(decode(&ids, &vocab), text);
     }
 
     #[test]
@@ -285,38 +374,28 @@ mod tests {
     #[test]
     fn test_decode_space() {
         // GGML vocab stores actual decoded text; space token has text " "
-        let vocab = vec![VocabEntry {
-            text: " Hello".to_string(),
-        }];
+        let vocab = vec![VocabEntry::from_text(" Hello")];
         assert_eq!(decode(&[0], &vocab), " Hello");
     }
 
     #[test]
     fn test_decode_japanese() {
-        let vocab = vec![VocabEntry {
-            text: "はい".to_string(),
-        }];
+        let vocab = vec![VocabEntry::from_text("はい")];
         assert_eq!(decode(&[0], &vocab), "はい");
     }
 
     #[test]
     fn test_decode_skips_special() {
         let vocab = vec![
-            VocabEntry {
-                text: "<|startoftranscript|>".to_string(),
-            },
-            VocabEntry {
-                text: "Hello".to_string(),
-            },
+            VocabEntry::from_text("<|startoftranscript|>"),
+            VocabEntry::from_text("Hello"),
         ];
         assert_eq!(decode(&[0, 1], &vocab), "Hello");
     }
 
     #[test]
     fn test_decode_out_of_range() {
-        let vocab = vec![VocabEntry {
-            text: "hi".to_string(),
-        }];
+        let vocab = vec![VocabEntry::from_text("hi")];
         assert_eq!(decode(&[0, 9999], &vocab), "hi");
     }
 
@@ -354,12 +433,8 @@ mod tests {
     fn test_parse_segments_with_timestamps() {
         // Build a minimal vocab: 0="Hello", 1=" world"
         let vocab = vec![
-            VocabEntry {
-                text: "Hello".to_string(),
-            },
-            VocabEntry {
-                text: " world".to_string(),
-            },
+            VocabEntry::from_text("Hello"),
+            VocabEntry::from_text(" world"),
         ];
         // Timestamp tokens: 50364 = 0.00s, 50464 = 2.00s (50364+100, 100*0.02=2.0)
         let ts_start: u32 = 50364; // 0.00s
@@ -376,12 +451,8 @@ mod tests {
     #[test]
     fn test_parse_segments_multiple() {
         let vocab = vec![
-            VocabEntry {
-                text: "Hello".to_string(),
-            }, // 0
-            VocabEntry {
-                text: " there".to_string(),
-            }, // 1
+            VocabEntry::from_text("Hello"),  // 0
+            VocabEntry::from_text(" there"), // 1
         ];
         // Two segments: <|0.00|> Hello <|1.00|> there <|2.00|>
         let ts0: u32 = 50364; // 0.00s
@@ -402,12 +473,8 @@ mod tests {
     #[test]
     fn test_parse_segments_no_timestamps() {
         let vocab = vec![
-            VocabEntry {
-                text: "Hello".to_string(),
-            },
-            VocabEntry {
-                text: " world".to_string(),
-            },
+            VocabEntry::from_text("Hello"),
+            VocabEntry::from_text(" world"),
         ];
         let tokens = vec![0, 1];
         let segments = parse_segments(&tokens, &vocab);

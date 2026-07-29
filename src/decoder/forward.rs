@@ -24,6 +24,53 @@ const LANG_TOKEN_START: u32 = 50259;
 /// One-past the last language token (99 languages total).
 const LANG_TOKEN_END: u32 = 50358;
 
+/// The decoder's tied token-embedding table.
+///
+/// Quantized checkpoints keep this matrix in its native block layout (it is by
+/// far the largest tensor in the model — 20 M elements even for `tiny`), so the
+/// embedding lookup has to be able to gather a row from either representation.
+/// Requiring an f32 tensor here made every quantized whisper.cpp checkpoint
+/// fail with `Missing tensor: decoder.token_embedding.weight`.
+pub(crate) enum TokenEmbedding<'a> {
+    /// Plain f32 table, shape `[n_state, n_vocab]` in GGML order.
+    Float(&'a Tensor),
+    /// Block-quantized table, shape `[n_state, n_vocab]` in GGML order.
+    Quantized(&'a crate::quantize::QuantizedTensor),
+}
+
+impl TokenEmbedding<'_> {
+    /// Number of vocabulary rows in the table.
+    fn n_vocab(&self) -> usize {
+        match self {
+            Self::Float(t) => t.shape.get(1).copied().unwrap_or(0),
+            Self::Quantized(q) => q.shape.get(1).copied().unwrap_or(0),
+        }
+    }
+
+    /// Copy the embedding row of token `idx` into `out` (length `n_state`).
+    ///
+    /// Does nothing when `idx` is out of range, leaving `out` untouched.
+    fn write_row(&self, idx: usize, out: &mut [f32]) {
+        if idx >= self.n_vocab() {
+            return;
+        }
+        match self {
+            Self::Float(t) => {
+                let n_state = out.len();
+                let start = idx * n_state;
+                if let Some(row) = t.data.get(start..start + n_state) {
+                    out.copy_from_slice(row);
+                }
+            }
+            Self::Quantized(q) => {
+                let row = q.row_bytes(idx);
+                let deq = crate::quantize::dequantize(row, out.len(), q.qtype);
+                out.copy_from_slice(&deq);
+            }
+        }
+    }
+}
+
 /// Read-only context passed to every `forward()` call.
 /// Groups all model/shape parameters so call-sites stay readable.
 pub(crate) struct ForwardCtx<'a> {
@@ -33,8 +80,8 @@ pub(crate) struct ForwardCtx<'a> {
     pub(crate) cross_v: &'a [Vec<f32>],
     /// Encoder output sequence length.
     pub(crate) enc_len: usize,
-    /// Token embedding weight matrix.
-    pub(crate) tok_emb: &'a Tensor,
+    /// Token embedding weight matrix (f32 or block-quantized).
+    pub(crate) tok_emb: TokenEmbedding<'a>,
     /// Positional embedding matrix.
     pub(crate) pos_emb: &'a Tensor,
     /// Reference to all model weights.
@@ -111,11 +158,21 @@ pub fn decode(
         cross_v.push(to_head_first(&cv.data, n_head, enc_len, head_dim));
     }
 
+    let tok_emb_name = "decoder.token_embedding.weight";
+    let tok_emb = match model.try_get(tok_emb_name) {
+        Some(t) => TokenEmbedding::Float(t),
+        None => TokenEmbedding::Quantized(
+            model
+                .get_quantized(tok_emb_name)
+                .ok_or_else(|| format!("Missing tensor: {tok_emb_name}"))?,
+        ),
+    };
+
     let ctx = ForwardCtx {
         cross_k: &cross_k,
         cross_v: &cross_v,
         enc_len,
-        tok_emb: model.get("decoder.token_embedding.weight")?,
+        tok_emb,
         pos_emb: model.get("decoder.positional_embedding")?,
         model,
         n_state,
@@ -341,7 +398,7 @@ pub(crate) fn encode_prompt_text(text: &str, vocab: &[crate::model::VocabEntry])
         let mut best_len = 0;
         let mut best_tok = 0u32;
         for (i, entry) in vocab.iter().enumerate() {
-            let entry_bytes = entry.text.as_bytes();
+            let entry_bytes = entry.as_bytes();
             if entry_bytes.len() > best_len && bytes[pos..].starts_with(entry_bytes) {
                 best_len = entry_bytes.len();
                 best_tok = i as u32;
@@ -409,11 +466,9 @@ pub(crate) fn forward(
     let mut x_data = vec![0.0f32; q_len * n_state];
     for (i, &tok) in tokens.iter().enumerate() {
         let idx = tok as usize;
-        // GGML tok_emb shape: [n_state, n_vocab] -- check against shape[1] (n_vocab).
-        if idx < ctx.tok_emb.shape[1] {
-            x_data[i * n_state..(i + 1) * n_state]
-                .copy_from_slice(&ctx.tok_emb.data[idx * n_state..(idx + 1) * n_state]);
-        }
+        // GGML tok_emb shape: [n_state, n_vocab]; out-of-range ids are skipped.
+        ctx.tok_emb
+            .write_row(idx, &mut x_data[i * n_state..(i + 1) * n_state]);
         let pos = start_pos + i;
         // GGML pos_emb shape: [n_state, n_text_ctx] -- check against shape[1] (n_text_ctx).
         if pos < ctx.pos_emb.shape[1] {
@@ -625,18 +680,10 @@ mod tests {
     fn test_encode_prompt_text_basic() {
         use crate::model::VocabEntry;
         let vocab = vec![
-            VocabEntry {
-                text: "he".to_string(),
-            },
-            VocabEntry {
-                text: "hello".to_string(),
-            },
-            VocabEntry {
-                text: " ".to_string(),
-            },
-            VocabEntry {
-                text: "world".to_string(),
-            },
+            VocabEntry::from_text("he"),
+            VocabEntry::from_text("hello"),
+            VocabEntry::from_text(" "),
+            VocabEntry::from_text("world"),
         ];
         let tokens = encode_prompt_text("hello world", &vocab);
         assert_eq!(tokens, vec![1, 2, 3]);
@@ -645,14 +692,7 @@ mod tests {
     #[test]
     fn test_encode_prompt_text_skips_unknown_bytes() {
         use crate::model::VocabEntry;
-        let vocab = vec![
-            VocabEntry {
-                text: "a".to_string(),
-            },
-            VocabEntry {
-                text: "b".to_string(),
-            },
-        ];
+        let vocab = vec![VocabEntry::from_text("a"), VocabEntry::from_text("b")];
         let tokens = encode_prompt_text("axb", &vocab);
         assert_eq!(tokens, vec![0, 1]);
     }
@@ -660,9 +700,7 @@ mod tests {
     #[test]
     fn test_encode_prompt_text_empty() {
         use crate::model::VocabEntry;
-        let vocab = vec![VocabEntry {
-            text: "a".to_string(),
-        }];
+        let vocab = vec![VocabEntry::from_text("a")];
         let tokens = encode_prompt_text("", &vocab);
         assert!(tokens.is_empty());
     }

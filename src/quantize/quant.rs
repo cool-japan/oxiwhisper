@@ -1,10 +1,12 @@
-//! Quantization: f32 -> Q4_0, Q5_0, Q8_0 block and full-tensor quantization.
+//! Quantization: f32 -> Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 block and full-tensor
+//! quantization.
 
 use half::f16;
 
 use super::types::{
-    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES,
-    Q8_0_BLOCK_SIZE, QuantType, QuantizedTensor,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE, Q4_1_BLOCK_BYTES, Q4_1_BLOCK_SIZE, Q5_0_BLOCK_BYTES,
+    Q5_0_BLOCK_SIZE, Q5_1_BLOCK_BYTES, Q5_1_BLOCK_SIZE, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_SIZE,
+    QuantType, QuantizedTensor,
 };
 
 // ---------------------------------------------------------------------------
@@ -172,6 +174,154 @@ pub fn quantize_block_q5_0(input: &[f32], output: &mut [u8]) {
     output[5] = qh_bytes[3];
 }
 
+/// Quantize a single block of 32 f32 values into Q4_1 format (20 bytes).
+///
+/// Layout: `[f16 scale d LE][f16 min m LE][16 bytes of nibble pairs]`.
+///
+/// Q4_1 is an *affine* scheme: the block minimum is stored explicitly and the
+/// nibble is unsigned, `q = clamp(round((value - m) / d), 0, 15)`, so that
+/// `value ≈ q * d + m`.
+///
+/// # Panics
+///
+/// Debug-asserts that `input.len() >= 32` and `output.len() >= 20`.
+pub fn quantize_block_q4_1(input: &[f32], output: &mut [u8]) {
+    debug_assert!(input.len() >= Q4_1_BLOCK_SIZE);
+    debug_assert!(output.len() >= Q4_1_BLOCK_BYTES);
+
+    let block = &input[..Q4_1_BLOCK_SIZE];
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &v in block {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+
+    let scale = (max - min) / 15.0;
+    // Round-trip the affine parameters through f16 so the quantized values are
+    // chosen against the coefficients the dequantizer will actually see.
+    let scale = f16::from_f32(scale).to_f32();
+    let min = f16::from_f32(min).to_f32();
+    let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+
+    output[0..2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+    output[2..4].copy_from_slice(&f16::from_f32(min).to_le_bytes());
+
+    for i in 0..16 {
+        let lo = (((block[i] - min) * inv_scale).round()).clamp(0.0, 15.0) as u8;
+        let hi = (((block[i + 16] - min) * inv_scale).round()).clamp(0.0, 15.0) as u8;
+        output[4 + i] = lo | (hi << 4);
+    }
+}
+
+/// Quantize a single block of 32 f32 values into Q5_1 format (24 bytes).
+///
+/// Layout: `[f16 scale d LE][f16 min m LE][u32 high-bit mask LE][16 nibble pairs]`.
+///
+/// Affine 5-bit scheme: `q = clamp(round((value - m) / d), 0, 31)` with the low
+/// four bits packed like Q4_0 and bit 4 stored in the per-block mask.
+///
+/// # Panics
+///
+/// Debug-asserts that `input.len() >= 32` and `output.len() >= 24`.
+pub fn quantize_block_q5_1(input: &[f32], output: &mut [u8]) {
+    debug_assert!(input.len() >= Q5_1_BLOCK_SIZE);
+    debug_assert!(output.len() >= Q5_1_BLOCK_BYTES);
+
+    let block = &input[..Q5_1_BLOCK_SIZE];
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &v in block {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+
+    let scale = (max - min) / 31.0;
+    let scale = f16::from_f32(scale).to_f32();
+    let min = f16::from_f32(min).to_f32();
+    let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+
+    output[0..2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+    output[2..4].copy_from_slice(&f16::from_f32(min).to_le_bytes());
+
+    let mut qh: u32 = 0;
+    for i in 0..16 {
+        let lo_q = (((block[i] - min) * inv_scale).round()).clamp(0.0, 31.0) as u32;
+        let hi_q = (((block[i + 16] - min) * inv_scale).round()).clamp(0.0, 31.0) as u32;
+
+        output[8 + i] = (lo_q & 0x0F) as u8 | (((hi_q & 0x0F) as u8) << 4);
+        qh |= ((lo_q >> 4) & 1) << i;
+        qh |= ((hi_q >> 4) & 1) << (i + 16);
+    }
+    output[4..8].copy_from_slice(&qh.to_le_bytes());
+}
+
+/// Quantize an entire f32 slice into Q4_1 format.
+///
+/// `data.len()` must be divisible by 32.
+///
+/// # Errors
+///
+/// Returns `Err` if the input length is not a multiple of `Q4_1_BLOCK_SIZE`.
+pub fn quantize_to_q4_1(data: &[f32]) -> Result<Vec<u8>, String> {
+    if !data.len().is_multiple_of(Q4_1_BLOCK_SIZE) {
+        return Err(format!(
+            "quantize_to_q4_1: input length {} is not a multiple of {}",
+            data.len(),
+            Q4_1_BLOCK_SIZE
+        ));
+    }
+    let n_blocks = data.len() / Q4_1_BLOCK_SIZE;
+    let mut output = vec![0u8; n_blocks * Q4_1_BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let in_start = b * Q4_1_BLOCK_SIZE;
+        let out_start = b * Q4_1_BLOCK_BYTES;
+        quantize_block_q4_1(
+            &data[in_start..in_start + Q4_1_BLOCK_SIZE],
+            &mut output[out_start..out_start + Q4_1_BLOCK_BYTES],
+        );
+    }
+    Ok(output)
+}
+
+/// Quantize an entire f32 slice into Q5_1 format.
+///
+/// `data.len()` must be divisible by 32.
+///
+/// # Errors
+///
+/// Returns `Err` if the input length is not a multiple of `Q5_1_BLOCK_SIZE`.
+pub fn quantize_to_q5_1(data: &[f32]) -> Result<Vec<u8>, String> {
+    if !data.len().is_multiple_of(Q5_1_BLOCK_SIZE) {
+        return Err(format!(
+            "quantize_to_q5_1: input length {} is not a multiple of {}",
+            data.len(),
+            Q5_1_BLOCK_SIZE
+        ));
+    }
+    let n_blocks = data.len() / Q5_1_BLOCK_SIZE;
+    let mut output = vec![0u8; n_blocks * Q5_1_BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let in_start = b * Q5_1_BLOCK_SIZE;
+        let out_start = b * Q5_1_BLOCK_BYTES;
+        quantize_block_q5_1(
+            &data[in_start..in_start + Q5_1_BLOCK_SIZE],
+            &mut output[out_start..out_start + Q5_1_BLOCK_BYTES],
+        );
+    }
+    Ok(output)
+}
+
 /// Quantize an entire f32 slice into Q5_0 format.
 ///
 /// `data.len()` must be divisible by 32.
@@ -281,7 +431,9 @@ pub fn quantize_tensor(
 
     let raw = match qtype {
         QuantType::Q4_0 => quantize_to_q4_0(data)?,
+        QuantType::Q4_1 => quantize_to_q4_1(data)?,
         QuantType::Q5_0 => quantize_to_q5_0(data)?,
+        QuantType::Q5_1 => quantize_to_q5_1(data)?,
         QuantType::Q8_0 => quantize_to_q8_0(data)?,
     };
 

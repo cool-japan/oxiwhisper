@@ -89,7 +89,12 @@ fn bench_mel_spectrogram(c: &mut Criterion) {
             BenchmarkId::new("duration", format!("{duration_secs}s")),
             &audio,
             |b, audio| {
-                b.iter(|| black_box(oxiwhisper::mel::log_mel_spectrogram(audio, &mel_filters)));
+                b.iter(|| {
+                    black_box(
+                        oxiwhisper::mel::log_mel_spectrogram(audio, &mel_filters)
+                            .expect("mel filter bank must be well formed"),
+                    )
+                });
             },
         );
     }

@@ -138,11 +138,14 @@ impl GgufArray {
     }
 }
 
-/// GGUF-side ggml tensor type IDs.
+/// ggml tensor type IDs.
 ///
-/// These match the `ggml_type` enum in the C implementation.
-/// Note: these differ from GGML legacy format dtype IDs used in the old
-/// whisper.cpp binary format (e.g., Q8_0=3 there vs Q8_0=8 here).
+/// These match the `ggml_type` enum in the C implementation, and the **same**
+/// discriminants are used by the legacy GGML whisper container — an earlier
+/// note here claimed otherwise (`Q8_0 = 3` for legacy files), which is what led
+/// the GGML loader to mis-map Q8_0 onto Q4_1's slot and reject Q5_1 and Q8_0
+/// outright. `crate::quantize::QuantType::from_ggml_type` is the single shared
+/// table for both loaders.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GgmlType {

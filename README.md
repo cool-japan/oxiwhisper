@@ -22,7 +22,7 @@ Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 
 ### Inference
 - GGML and GGUF model loading (`ggml-tiny.bin`, `ggml-tiny.gguf`, etc.). Both formats are supported; the loader auto-detects the format from the file magic bytes — just change the path, no code change needed.
-- Q4_0, Q5_0, and Q8_0 quantized inference with dequantize-on-the-fly GEMV
+- Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 quantized inference with dequantize-on-the-fly GEMV
 - SIMD-accelerated dot products: AVX2+FMA (x86_64), NEON (aarch64), simd128 (WASM)
 - `matrixmultiply::sgemm` for attention QK^T and scores@V with stride-based transpose
 - Arc copy-on-write KV cache for beam search
@@ -61,7 +61,7 @@ Pure Rust Whisper speech-to-text inference engine. Zero C/C++ dependencies.
 - `transcribe_to_srt()`, `transcribe_to_vtt()` subtitle export
 - `stream()` returning `StreamTranscriber` for real-time processing
 - `encoder_output()` for embedding extraction
-- `mel_spectrogram()` for audio analysis
+- `mel_spectrogram()` for audio analysis (returns the padded 30 s window)
 - `model_stats()` for memory/parameter statistics
 - `oxiwhisper::threading::set_thread_count(n)` — configure the rayon thread-pool size when the `parallel` feature is enabled
 - Optional `serde` feature for JSON serialization via `to_json()`

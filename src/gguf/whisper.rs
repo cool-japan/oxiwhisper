@@ -195,12 +195,12 @@ pub(crate) fn build_vocab(
         if arr.elem_type() != GgufValueType::String && arr.elem_type() != GgufValueType::U8 {
             // Non-string token arrays are unexpected; proceed with best-effort coercion.
         }
+        // Store the raw bytes of each token. GGUF strings are UTF-8 by spec, so
+        // `as_bytes` is byte-exact here; the decoder joins bytes and converts
+        // once, exactly as for the legacy GGML container.
         arr.values
             .iter()
-            .map(|v| {
-                let text = v.as_str().unwrap_or("").to_string();
-                VocabEntry { text }
-            })
+            .map(|v| VocabEntry::from_text(v.as_str().unwrap_or("")))
             .collect()
     } else {
         Vec::new()
@@ -208,9 +208,7 @@ pub(crate) fn build_vocab(
 
     // Pad with synthetic entries if the array is shorter than n_vocab.
     while vocab.len() < n_vocab {
-        vocab.push(VocabEntry {
-            text: format!("<|{}|>", vocab.len()),
-        });
+        vocab.push(VocabEntry::from_text(format!("<|{}|>", vocab.len())));
     }
 
     // Truncate if somehow longer.
@@ -221,12 +219,20 @@ pub(crate) fn build_vocab(
 
 // ── Mel filter resolver ───────────────────────────────────────────────────────
 
-/// Resolve the mel filter bank using a three-tier fallback strategy:
+/// Resolve the mel filter bank using a three-tier strategy:
 ///
 /// 1. A tensor named `"mel_filters"` already loaded in `tensors`.
 /// 2. A KV entry `"whisper.mel_filters"` containing an f32 array.
 /// 3. Programmatic generation via [`crate::mel_filters::generate_mel_filters`]
 ///    (works only for the standard 80-mel configuration).
+///
+/// # Errors
+///
+/// Returns [`OxiWhisperError::InvalidModel`] when the file carries no filter
+/// bank and `n_mels` is not 80. Earlier versions silently substituted an
+/// **all-zero** filter bank in that case, which made every non-80-mel model
+/// (notably `large-v3`, 128 mels) transcribe pure silence while reporting
+/// success.
 pub(crate) fn resolve_mel_filters(
     kv: &HashMap<String, GgufValue>,
     tensors: &HashMap<String, Tensor>,
@@ -250,12 +256,14 @@ pub(crate) fn resolve_mel_filters(
     }
 
     // Tier 3: programmatic fallback (standard 80-mel filter bank)
-    if n_mels == crate::mel_filters::WHISPER_MEL_FILTER_SIZE / (crate::mel::WHISPER_N_FFT / 2 + 1) {
+    if n_mels == crate::mel::WHISPER_N_MELS {
         return Ok(crate::mel_filters::generate_mel_filters());
     }
 
-    // Generate a placeholder filter bank of the right size for non-standard n_mels.
-    // This is a zero filter bank — it will produce silence but won't panic.
-    let n_fft_bins = crate::mel::WHISPER_N_FFT / 2 + 1;
-    Ok(vec![0.0f32; n_mels * n_fft_bins])
+    Err(OxiWhisperError::InvalidModel(format!(
+        "GGUF model declares {n_mels} mel channels but carries no mel filter bank \
+         (neither a `mel_filters` tensor nor a `whisper.mel_filters` KV array), and \
+         oxiwhisper can only generate the standard {}-channel bank",
+        crate::mel::WHISPER_N_MELS
+    )))
 }

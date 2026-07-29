@@ -211,17 +211,31 @@ pub(crate) fn apply_suppress_blank(
 
 /// Apply OpenAI's `ApplyTimestampRules` logit filter in place.
 ///
-/// Enforces four timestamp invariants before sampling each token when timestamps
-/// are enabled:
-/// - **(a)** `<|notimestamps|>` is always suppressed;
-/// - **(b)** Timestamps are emitted in non-decreasing pairs: force-text after a complete
-///   pair, force-timestamp after a lone timestamp, monotonic lower bound;
-/// - **(c)** Force a timestamp when total timestamp probability mass exceeds the
-///   highest individual text-token probability.
+/// Faithful port of `whisper/decoding.py::ApplyTimestampRules`. Enforces, in
+/// order:
 ///
-/// `generated` is the sequence of output tokens emitted so far (excluding prompt).
-/// Must be called AFTER `apply_suppress_tokens` and `apply_no_repeat_ngram` but
-/// BEFORE the argmax/sample step.
+/// - **(a)** `<|notimestamps|>` is always suppressed.
+/// - **(b)** The first sampled token must be a timestamp (all text logits are
+///   masked while nothing has been generated yet).
+/// - **(c)** Timestamps come in pairs: if the last token is a timestamp *and*
+///   the penultimate one is a timestamp **or does not exist**, the next token
+///   must be text; if the last token is a timestamp preceded by text, the next
+///   token must not be ordinary text — only `<|endoftext|>` and another
+///   timestamp remain legal, which is what closes a segment.
+/// - **(d)** Timestamps never decrease. After a *lone* timestamp the closing
+///   partner may repeat it; otherwise the next timestamp must be strictly
+///   greater, which prevents zero-length segments and the associated infinite
+///   loop.
+/// - **(e)** If the total probability mass on timestamps exceeds the best
+///   single text token, force a timestamp.
+///
+/// The emitted stream therefore looks like
+/// `<|0.00|> text <|2.00|><|2.00|> text <|4.00|><|endoftext|>` — exactly what
+/// [`crate::tokenizer::parse_segments`] expects.
+///
+/// `generated` is the sequence of output tokens emitted so far (excluding the
+/// prompt). Must be called AFTER `apply_suppress_tokens` and
+/// `apply_no_repeat_ngram` but BEFORE the argmax/sample step.
 pub(crate) fn apply_timestamp_rules(
     logits: &mut [f32],
     generated: &[u32],
@@ -233,51 +247,73 @@ pub(crate) fn apply_timestamp_rules(
     if ts_begin >= vocab {
         return; // degenerate vocab without timestamp tokens
     }
+    let eot = (special.eot as usize).min(ts_begin);
 
     // (a) Always suppress <|notimestamps|>.
     if (special.no_timestamps as usize) < vocab {
         logits[special.no_timestamps as usize] = f32::NEG_INFINITY;
     }
 
-    // (b) Pair and monotonic enforcement based on the last 1-2 emitted tokens.
+    // (b)/(c) Pair enforcement based on the last two emitted tokens.
+    //
+    // NOTE the asymmetry, which the previous implementation had inverted:
+    // OpenAI treats "there is no penultimate token" as `penultimate_was_timestamp
+    // = true`, so a transcript that begins `<|0.00|>` must continue with TEXT,
+    // never with a second timestamp.
     let last_was_ts = generated
         .last()
         .is_some_and(|&t| SpecialTokens::is_timestamp(t));
-    let penult_was_ts = generated
-        .len()
-        .checked_sub(2)
-        .map(|i| SpecialTokens::is_timestamp(generated[i]))
-        .unwrap_or(false);
+    let penult_was_ts = generated.len() < 2
+        || generated
+            .get(generated.len() - 2)
+            .is_some_and(|&t| SpecialTokens::is_timestamp(t));
 
     if last_was_ts {
         if penult_was_ts {
-            // Complete pair just closed → force text next.
+            // A complete pair just closed (or the opening timestamp was just
+            // emitted) → the next token has to be text.
             for l in &mut logits[ts_begin..] {
                 *l = f32::NEG_INFINITY;
             }
         } else {
-            // Lone timestamp → force another timestamp to close the pair.
-            // All text tokens (including EOT) are suppressed; the model must
-            // emit a closing timestamp before any further text or termination.
-            for l in logits[..ts_begin].iter_mut() {
+            // Lone timestamp closing a segment → ordinary text is forbidden,
+            // but `<|endoftext|>` stays available so the transcript can end
+            // here. Only `[0, eot)` is masked, never `[0, ts_begin)`.
+            for l in &mut logits[..eot] {
                 *l = f32::NEG_INFINITY;
             }
         }
     }
 
-    // Monotonic lower bound: suppress timestamps strictly below the last emitted one.
+    // (d) Monotonic lower bound on timestamps.
     if let Some(&last_ts) = generated
         .iter()
         .rev()
         .find(|&&t| SpecialTokens::is_timestamp(t))
     {
-        let lo = (last_ts as usize).min(vocab);
+        // The pair-closing timestamp may repeat the opening one (zero-length is
+        // legal only for that single position); every other continuation must
+        // move strictly forward.
+        let bound = if last_was_ts && !penult_was_ts {
+            last_ts as usize
+        } else {
+            (last_ts as usize).saturating_add(1)
+        };
+        let lo = bound.min(vocab);
         for l in &mut logits[ts_begin..lo] {
             *l = f32::NEG_INFINITY;
         }
     }
 
-    // (c) Force timestamp when total timestamp mass dominates the best text token.
+    // (b, initial position) Nothing generated yet → the first sampled token
+    // must be a timestamp.
+    if generated.is_empty() {
+        for l in &mut logits[..ts_begin] {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+
+    // (e) Force timestamp when total timestamp mass dominates the best text token.
     // The log-softmax normaliser is the same for all tokens, so it cancels and we
     // compare raw logits directly. Use a local numerically-stable logsumexp over
     // the timestamp tail to avoid a full-vocab allocation.
@@ -716,6 +752,47 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_rules_first_token_must_be_timestamp() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        apply_timestamp_rules(&mut logits, &[], &special);
+        for (i, &l) in logits[..TIMESTAMP_BEGIN as usize].iter().enumerate() {
+            assert_eq!(
+                l,
+                f32::NEG_INFINITY,
+                "text_logit[{i}] must be -inf at the initial position"
+            );
+        }
+        assert!(logits[TIMESTAMP_BEGIN as usize].is_finite());
+    }
+
+    #[test]
+    fn test_timestamp_rules_opening_timestamp_forces_text() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        // Only the opening timestamp has been generated: OpenAI treats a
+        // missing penultimate token as "was a timestamp", so TEXT must follow.
+        // The previous implementation inverted this and forced a second
+        // timestamp, which made 30 s-padded audio decode to an empty
+        // transcript.
+        let generated = [TIMESTAMP_BEGIN];
+        apply_timestamp_rules(&mut logits, &generated, &special);
+        for (i, &l) in logits[TIMESTAMP_BEGIN as usize..].iter().enumerate() {
+            assert_eq!(
+                l,
+                f32::NEG_INFINITY,
+                "ts_logit[{i}] must be -inf right after the opening timestamp"
+            );
+        }
+        assert!(
+            logits[100].is_finite(),
+            "text tokens must stay available after the opening timestamp"
+        );
+    }
+
+    #[test]
     fn test_timestamp_rules_force_text_after_pair() {
         use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
         let special = SpecialTokens::new(51865);
@@ -738,21 +815,47 @@ mod tests {
     fn test_timestamp_rules_force_timestamp_after_lone() {
         use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
         let special = SpecialTokens::new(51865);
-        let mut logits = vec![0.0f32; 51865];
+        // Give EOT a dominant logit so the mass-dominance rule (which masks the
+        // whole text region, EOT included) does not fire and we observe the
+        // pair rule in isolation.
+        let mut logits = vec![-10.0f32; 51865];
+        logits[special.eot as usize] = 50.0;
         let generated = [100u32, TIMESTAMP_BEGIN + 5]; // last is lone timestamp
         apply_timestamp_rules(&mut logits, &generated, &special);
-        // ALL text tokens (including EOT) must be suppressed — the model must
-        // emit a closing timestamp before it can output text or terminate.
-        // This matches OpenAI's ApplyTimestampRules: `logits[:, :TIMESTAMP_BEGIN] = -inf`.
-        for (i, &l) in logits[..TIMESTAMP_BEGIN as usize].iter().enumerate() {
+        // Ordinary text tokens are suppressed — the model must close the pair.
+        // This matches OpenAI's ApplyTimestampRules: `logits[:, :eot] = -inf`.
+        for (i, &l) in logits[..special.eot as usize].iter().enumerate() {
             assert_eq!(
                 l,
                 f32::NEG_INFINITY,
                 "text_logit[{i}] should be -inf after lone ts"
             );
         }
+        // EOT itself stays available so the transcript can terminate here.
+        assert!(
+            logits[special.eot as usize].is_finite(),
+            "EOT must remain reachable after a lone timestamp"
+        );
         // Timestamps at or above the monotonic floor must be finite.
         assert!(logits[(TIMESTAMP_BEGIN + 5) as usize].is_finite());
+    }
+
+    #[test]
+    fn test_timestamp_rules_strict_increase_after_closed_pair() {
+        use crate::tokenizer::{SpecialTokens, TIMESTAMP_BEGIN};
+        let special = SpecialTokens::new(51865);
+        let mut logits = vec![0.0f32; 51865];
+        // ts, ts (pair closed), then a text token: the next timestamp must be
+        // strictly greater than the last one, otherwise the segment would have
+        // zero length and the decoder could loop forever.
+        let generated = [TIMESTAMP_BEGIN, TIMESTAMP_BEGIN + 10, 100];
+        apply_timestamp_rules(&mut logits, &generated, &special);
+        assert_eq!(
+            logits[(TIMESTAMP_BEGIN + 10) as usize],
+            f32::NEG_INFINITY,
+            "repeating the last timestamp must be blocked once the pair closed"
+        );
+        assert!(logits[(TIMESTAMP_BEGIN + 11) as usize].is_finite());
     }
 
     #[test]
@@ -762,7 +865,9 @@ mod tests {
         let mut logits = vec![1.0f32; 51865];
         let generated = [100u32, 200, TIMESTAMP_BEGIN + 100]; // last ts at +100
         apply_timestamp_rules(&mut logits, &generated, &special);
-        // Timestamps below TIMESTAMP_BEGIN+100 must be NEG_INFINITY
+        // Timestamps below TIMESTAMP_BEGIN+100 must be NEG_INFINITY. The last
+        // token is a lone timestamp, so the pair-closing partner may repeat it
+        // and the floor is inclusive.
         let floor_start = TIMESTAMP_BEGIN as usize;
         let floor_end = (TIMESTAMP_BEGIN + 100) as usize;
         for (i, &l) in logits[floor_start..floor_end].iter().enumerate() {
@@ -790,9 +895,14 @@ mod tests {
         for l in &mut logits[..TIMESTAMP_BEGIN as usize] {
             *l = -10.0;
         }
-        apply_timestamp_rules(&mut logits, &[], &special);
-        // Text region (except eot) should be NEG_INFINITY or unchanged —
-        // due to the mass-dominance rule all text logits become NEG_INFINITY
+        // Use a non-initial state (last token is text) so the outcome is driven
+        // by the mass-dominance rule alone rather than the initial-position rule.
+        apply_timestamp_rules(
+            &mut logits,
+            &[TIMESTAMP_BEGIN, TIMESTAMP_BEGIN + 1, 100],
+            &special,
+        );
+        // Text region should be NEG_INFINITY — the timestamp mass dominates.
         for (i, &l) in logits[..TIMESTAMP_BEGIN as usize].iter().enumerate() {
             if i as u32 != special.eot && i as u32 != special.no_timestamps {
                 assert_eq!(

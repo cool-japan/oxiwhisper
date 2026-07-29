@@ -222,7 +222,9 @@ pub fn linear_quantized(input: &Tensor, weight: &QuantizedTensor, bias: Option<&
 
     let dot_fn: fn(&[f32], &[u8], usize) -> f32 = match weight.qtype {
         QuantType::Q4_0 => quantize::dot_q4_0_fast,
+        QuantType::Q4_1 => quantize::dot_q4_1_fast,
         QuantType::Q5_0 => quantize::dot_q5_0_fast,
+        QuantType::Q5_1 => quantize::dot_q5_1_fast,
         QuantType::Q8_0 => quantize::dot_q8_0_fast,
     };
 

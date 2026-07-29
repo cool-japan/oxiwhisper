@@ -382,9 +382,11 @@ mod tests {
             cross_k: &cross_k,
             cross_v: &cross_v,
             enc_len,
-            tok_emb: model
-                .get("decoder.token_embedding.weight")
-                .expect("tok_emb"),
+            tok_emb: crate::decoder::forward::TokenEmbedding::Float(
+                model
+                    .get("decoder.token_embedding.weight")
+                    .expect("tok_emb"),
+            ),
             pos_emb: model.get("decoder.positional_embedding").expect("pos_emb"),
             model: &model,
             n_state,
@@ -521,9 +523,11 @@ mod tests {
             cross_k: &cross_k,
             cross_v: &cross_v,
             enc_len,
-            tok_emb: model
-                .get("decoder.token_embedding.weight")
-                .expect("tok_emb"),
+            tok_emb: crate::decoder::forward::TokenEmbedding::Float(
+                model
+                    .get("decoder.token_embedding.weight")
+                    .expect("tok_emb"),
+            ),
             pos_emb: model.get("decoder.positional_embedding").expect("pos_emb"),
             model: &model,
             n_state,

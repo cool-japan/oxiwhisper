@@ -4,6 +4,108 @@ All notable changes to this project will be documented in this file.
 
 ## [0.2.0] - Unreleased
 
+### Fixed
+- **Japanese / CJK transcripts were mojibake.** The GGML loader decoded every
+  vocabulary entry with `String::from_utf8_lossy` at load time. Whisper uses
+  GPT-2 *byte-level* BPE, so a multi-byte character is routinely spelled by
+  several tokens that are not valid UTF-8 on their own — 1476 of the 50257
+  entries in `ggml-tiny.bin` were replaced by `U+FFFD`, making all kanji, kana
+  and hangul unrecoverable. `VocabEntry` now stores **raw bytes**
+  (`VocabEntry::bytes`, with `from_bytes` / `from_text` / `as_bytes` / `text()`
+  / `is_special()` accessors), and `tokenizer::decode` / `parse_segments`
+  concatenate bytes and run a single lossy UTF-8 conversion over the joined
+  buffer. New `tokenizer::decode_bytes` / `decode_bytes_into` expose the
+  byte-exact result. Mirrored in the GGUF and ONNX vocabulary builders.
+  Regression test: BPE tokens `[162, 116, 233]` (bytes `E6 B8 8B`) now decode
+  to the single kanji `渋` (U+6E0B).
+- **Segment timestamps were inverted, producing empty transcripts.**
+  `decode_utils::apply_timestamp_rules` treated a missing penultimate token as
+  "was not a timestamp", so it forced a *second* timestamp immediately after the
+  opening one instead of forcing text; it also masked the whole `[0, ts_begin)`
+  range — including `<|endoftext|>` — when closing a segment, and never applied
+  the strict-increase rule that prevents zero-length segments. 30 s-padded audio
+  therefore decoded to nothing. The filter is now a faithful port of OpenAI's
+  `ApplyTimestampRules`: the first sampled token must be a timestamp; a
+  timestamp whose predecessor is a timestamp *or absent* must be followed by
+  text; a timestamp preceded by text may only be followed by another timestamp
+  or `<|endoftext|>`; the monotonic floor is inclusive only for the pair-closing
+  partner. The synthetic fixture in `test_utils.rs`, which codified the wrong
+  rule, was regenerated accordingly.
+- **Word timestamps were reported at half their true value.**
+  `word_timestamps` used the 160-sample mel hop as the DTW column stride, but a
+  cross-attention column is one *encoder* frame — 320 samples / 20 ms, because
+  the encoder's second convolution has stride 2. The last word of an 11.0 s clip
+  came out at 5.51 s. The DTW is additionally restricted to the encoder frames
+  up to the decoded closing timestamp (OpenAI's `num_frames // 2` slice), so the
+  final word is no longer dragged out to the end of the 30 s zero padding.
+- **`WordTimedTranscript::text` ran words together** (`"helloworld"`). Words are
+  now re-joined with a space, except across boundaries that touch a script
+  written without inter-word spaces (CJK, kana, Thai, fullwidth forms).
+- **Word splitting collapsed Japanese into a single word.** The splitter keyed
+  purely on ASCII leading spaces. `dtw::build_word_segments_bytes` (new,
+  byte-based; `build_word_segments` is kept as a `&[String]` wrapper) now splits
+  on UTF-8 character boundaries when no token carries a leading space, and never
+  splits inside a character.
+- **The mel front-end warped every frequency by 1.28x.** The 400-sample analysis
+  window was zero-padded to 512 before the FFT while the filter bank still
+  assumed 40 Hz bins, so a 1 kHz tone landed in the 1254 Hz band. The transform
+  now runs on the exact 400-point window (`oxifft::rfft` handles non-power-of-two
+  sizes), adds the `center=True` 200-sample reflect pre-pad, and pads the output
+  to Whisper's fixed 3000-frame window — numerically identical to zero-padding
+  the audio to 30 s. New numeric test asserts a 1 kHz tone peaks in the mel band
+  centred near 1026 Hz.
+- **The legacy GGML dtype table was wrong, so no quantized checkpoint loaded.**
+  Dtype 3 was mapped to Q8_0 (3 is Q4_1) and 7/8 were rejected outright, so
+  `ggml-tiny-q8_0.bin`, `ggml-tiny-q5_1.bin` and friends all failed with
+  "Unsupported tensor dtype". The GGML and GGUF loaders now share one table
+  (`QuantType::from_ggml_type`): 2 = Q4_0, 3 = Q4_1, 6 = Q5_0, 7 = Q5_1,
+  8 = Q8_0; anything else (Q8_1, the K-quants, …) is rejected with a message
+  naming the type.
+- **`mel.rs` panicked on non-80-mel models.** An `assert_eq!(n_mels, 80)`
+  reachable from the public `transcribe()` aborted the process for `large-v3`
+  (128 mels). The channel count is now derived from the filter bank
+  (`mel::n_mels_from_filters`) and a mis-shaped bank returns
+  `OxiWhisperError::InvalidModel`.
+- **GGUF models with a non-standard mel count silently transcribed silence.**
+  `gguf::whisper::resolve_mel_filters` substituted an **all-zero** filter bank
+  when it could not generate one; it now returns `InvalidModel`.
+
+### Added
+- **Q4_1 and Q5_1 quantization kernels** — block dequantizers
+  (`dequantize_q4_1`, `dequantize_q5_1`, plus the `dequantize(data, n, qtype)`
+  dispatcher), dot products (`dot_q4_1`, `dot_q5_1` and their `_fast` shims) and
+  quantizers (`quantize_block_q4_1`, `quantize_to_q4_1`, `quantize_block_q5_1`,
+  `quantize_to_q5_1`). `quantize_tensor` covers all five types.
+- **Quantized token-embedding support.** `decoder.token_embedding.weight` is the
+  largest tensor in the model and is kept in block form by every quantized
+  checkpoint, which made the decoder fail with
+  `Missing tensor: decoder.token_embedding.weight`. The embedding lookup now
+  gathers rows from either an f32 or a quantized table.
+- **`mel::log_mel_spectrogram_unpadded`** — the same front-end without the
+  30 s padding, for analysis paths (embedding extraction, diarization) where the
+  full window would be pure overhead. `WhisperModel::encoder_output` uses it.
+- **`mel::WHISPER_N_FRAMES`** (3000) and **`mel::n_mels_from_filters`**.
+- **Real-model integration test** (`tests/real_model.rs`), skipped cleanly unless
+  `OXIWHISPER_TEST_MODEL` points at a checkpoint (and
+  `OXIWHISPER_TEST_MODEL_QUANT` for the quantized variant). Transcribes
+  `samples/jfk.wav` zero-padded to 30 s and asserts a plausible English
+  transcript, at least one ordered segment, a final segment end within 1.5 s of
+  the true 11 s duration, a last word after 9 s, and byte-exact multi-token
+  kanji decoding against the real vocabulary.
+- **`samples/jfk.wav`** — the whisper.cpp sample clip used by that test.
+
+### Changed
+- **Breaking:** `VocabEntry { text: String }` is now `VocabEntry { bytes: Vec<u8> }`.
+  Use `VocabEntry::from_text(..)` to construct and `entry.text()` (a
+  `Cow<'_, str>`) for a lossy per-entry view.
+- **Breaking:** `mel::log_mel_spectrogram` returns
+  `Result<Vec<f32>, OxiWhisperError>` and always emits the full 3000-frame
+  window. `WhisperModel::mel_spectrogram` returns
+  `Result<tensor::Tensor, OxiWhisperError>` for the same reason.
+- **Breaking:** `mel::n_frames_for_samples` now returns `n_samples / 160`
+  (clamped to `1..=3000`), matching `torch.stft(center=True)` with the trailing
+  frame dropped, instead of `ceil(n / 160) + 1`.
+
 ## [0.1.2] - 2026-07-11
 
 ### Added

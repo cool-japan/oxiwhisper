@@ -3,11 +3,13 @@
 use half::f16;
 
 use super::dequant::{
-    dequantize_q4_0, dequantize_q4_0_block, dequantize_q5_0, dequantize_q5_0_block,
-    dequantize_q8_0, dequantize_q8_0_block,
+    dequantize_q4_0, dequantize_q4_0_block, dequantize_q4_1_block, dequantize_q5_0,
+    dequantize_q5_0_block, dequantize_q5_1_block, dequantize_q8_0, dequantize_q8_0_block,
 };
-use super::dot_dispatch::{dot_q4_0_fast, dot_q5_0_fast, dot_q8_0_fast};
-use super::dot_scalar::{dot_q4_0, dot_q5_0, dot_q8_0};
+use super::dot_dispatch::{
+    dot_q4_0_fast, dot_q4_1_fast, dot_q5_0_fast, dot_q5_1_fast, dot_q8_0_fast,
+};
+use super::dot_scalar::{dot_q4_0, dot_q4_1, dot_q5_0, dot_q5_1, dot_q8_0};
 use super::quant::{quantize_tensor, quantize_to_q4_0, quantize_to_q5_0, quantize_to_q8_0};
 use super::types::{
     Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES,
@@ -978,5 +980,201 @@ fn test_q5_0_high_bit_values() {
             (out - expected).abs() < 1e-4,
             "Q5_0 high-bit test at {i}: expected {expected}, got {out}",
         );
+    }
+}
+
+// ── Q4_1 / Q5_1 (affine schemes) ──────────────────────────────────────────────
+
+/// Build a Q4_1 block (20 bytes) from `d`, `m` and 32 unsigned nibbles.
+fn make_q4_1_block(d: f32, m: f32, values: &[u8; 32]) -> [u8; super::types::Q4_1_BLOCK_BYTES] {
+    let mut block = [0u8; super::types::Q4_1_BLOCK_BYTES];
+    block[0..2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+    block[2..4].copy_from_slice(&f16::from_f32(m).to_le_bytes());
+    for i in 0..16 {
+        block[4 + i] = (values[i] & 0x0F) | ((values[i + 16] & 0x0F) << 4);
+    }
+    block
+}
+
+/// Build a Q5_1 block (24 bytes) from `d`, `m` and 32 unsigned 5-bit values.
+fn make_q5_1_block(d: f32, m: f32, values: &[u32; 32]) -> [u8; super::types::Q5_1_BLOCK_BYTES] {
+    let mut block = [0u8; super::types::Q5_1_BLOCK_BYTES];
+    block[0..2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+    block[2..4].copy_from_slice(&f16::from_f32(m).to_le_bytes());
+    let mut qh: u32 = 0;
+    for i in 0..16 {
+        let lo = values[i];
+        let hi = values[i + 16];
+        block[8 + i] = (lo & 0x0F) as u8 | (((hi & 0x0F) as u8) << 4);
+        qh |= ((lo >> 4) & 1) << i;
+        qh |= ((hi >> 4) & 1) << (i + 16);
+    }
+    block[4..8].copy_from_slice(&qh.to_le_bytes());
+    block
+}
+
+#[test]
+fn test_ggml_type_table_matches_ggml_conventions() {
+    // Regression: the legacy GGML loader used to map dtype 3 to Q8_0 (3 is
+    // Q4_1) and rejected 7/8 outright, so `ggml-*-q8_0.bin` and
+    // `ggml-*-q5_1.bin` could not be loaded at all.
+    assert_eq!(QuantType::from_ggml_type(2), Some(QuantType::Q4_0));
+    assert_eq!(QuantType::from_ggml_type(3), Some(QuantType::Q4_1));
+    assert_eq!(QuantType::from_ggml_type(6), Some(QuantType::Q5_0));
+    assert_eq!(QuantType::from_ggml_type(7), Some(QuantType::Q5_1));
+    assert_eq!(QuantType::from_ggml_type(8), Some(QuantType::Q8_0));
+    // Non-quantized and unimplemented schemes must not be guessed at.
+    for code in [0u32, 1, 4, 5, 9, 10, 11, 12, 13, 14, 15] {
+        assert_eq!(
+            QuantType::from_ggml_type(code),
+            None,
+            "ggml_type {code} must not map to a quantization kernel"
+        );
+    }
+}
+
+#[test]
+fn test_block_geometry_for_every_quant_type() {
+    let expected = [
+        (QuantType::Q4_0, 32usize, 18usize),
+        (QuantType::Q4_1, 32, 20),
+        (QuantType::Q5_0, 32, 22),
+        (QuantType::Q5_1, 32, 24),
+        (QuantType::Q8_0, 32, 34),
+    ];
+    for (qt, size, bytes) in expected {
+        assert_eq!(qt.block_size(), size, "{} block size", qt.name());
+        assert_eq!(qt.block_bytes(), bytes, "{} block bytes", qt.name());
+    }
+}
+
+#[test]
+fn test_dequantize_q4_1_block_affine() {
+    // value = q * d + m
+    let d = 0.25f32;
+    let m = -1.5f32;
+    let mut values = [0u8; 32];
+    for (i, v) in values.iter_mut().enumerate() {
+        *v = (i % 16) as u8;
+    }
+    let block = make_q4_1_block(d, m, &values);
+    let mut out = [0.0f32; 32];
+    dequantize_q4_1_block(&block, &mut out);
+    for i in 0..32 {
+        let expected = values[i] as f32 * d + m;
+        assert!(
+            (out[i] - expected).abs() < 1e-5,
+            "element {i}: got {}, expected {expected}",
+            out[i]
+        );
+    }
+}
+
+#[test]
+fn test_dequantize_q5_1_block_uses_high_bit() {
+    let d = 0.125f32;
+    let m = 2.0f32;
+    let mut values = [0u32; 32];
+    for (i, v) in values.iter_mut().enumerate() {
+        // Sweep the whole 0..=31 range so the packed 5th bit matters.
+        *v = (i as u32) % 32;
+    }
+    let block = make_q5_1_block(d, m, &values);
+    let mut out = [0.0f32; 32];
+    dequantize_q5_1_block(&block, &mut out);
+    for i in 0..32 {
+        let expected = values[i] as f32 * d + m;
+        assert!(
+            (out[i] - expected).abs() < 1e-5,
+            "element {i}: got {}, expected {expected}",
+            out[i]
+        );
+    }
+}
+
+#[test]
+fn test_dot_q4_1_matches_dequantized_dot() {
+    let d = 0.0625f32;
+    let m = -0.5f32;
+    let mut values = [0u8; 32];
+    for (i, v) in values.iter_mut().enumerate() {
+        *v = ((i * 7) % 16) as u8;
+    }
+    let block = make_q4_1_block(d, m, &values);
+    let input: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+
+    let mut deq = [0.0f32; 32];
+    dequantize_q4_1_block(&block, &mut deq);
+    let reference: f32 = input.iter().zip(deq.iter()).map(|(a, b)| a * b).sum();
+
+    let got = dot_q4_1(&input, &block, 32);
+    assert!(
+        (got - reference).abs() < 1e-4,
+        "dot_q4_1 = {got}, dequantized reference = {reference}"
+    );
+    assert!((dot_q4_1_fast(&input, &block, 32) - reference).abs() < 1e-4);
+}
+
+#[test]
+fn test_dot_q5_1_matches_dequantized_dot() {
+    let d = 0.03125f32;
+    let m = 1.25f32;
+    let mut values = [0u32; 32];
+    for (i, v) in values.iter_mut().enumerate() {
+        *v = ((i * 11) % 32) as u32;
+    }
+    let block = make_q5_1_block(d, m, &values);
+    let input: Vec<f32> = (0..32).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
+
+    let mut deq = [0.0f32; 32];
+    dequantize_q5_1_block(&block, &mut deq);
+    let reference: f32 = input.iter().zip(deq.iter()).map(|(a, b)| a * b).sum();
+
+    let got = dot_q5_1(&input, &block, 32);
+    assert!(
+        (got - reference).abs() < 1e-4,
+        "dot_q5_1 = {got}, dequantized reference = {reference}"
+    );
+    assert!((dot_q5_1_fast(&input, &block, 32) - reference).abs() < 1e-4);
+}
+
+#[test]
+fn test_quantize_dequantize_round_trip_affine_types() {
+    // Affine schemes carry an explicit block minimum, so they represent an
+    // asymmetric range far better than the symmetric Q4_0/Q5_0.
+    let data: Vec<f32> = (0..128).map(|i| 3.0 + (i as f32) * 0.02).collect();
+
+    for (qt, tol) in [(QuantType::Q4_1, 0.05f32), (QuantType::Q5_1, 0.02)] {
+        let tensor = quantize_tensor(&data, &[128], qt).expect("quantize");
+        assert_eq!(tensor.qtype, qt);
+        assert_eq!(tensor.raw.len(), 4 * qt.block_bytes());
+
+        let back = super::dequant::dequantize(&tensor.raw, data.len(), qt);
+        assert_eq!(back.len(), data.len());
+        for (i, (&orig, &rt)) in data.iter().zip(back.iter()).enumerate() {
+            assert!(
+                (orig - rt).abs() < tol,
+                "{} element {i}: {orig} -> {rt}",
+                qt.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_quantize_to_affine_rejects_unaligned_length() {
+    assert!(super::quant::quantize_to_q4_1(&[0.0f32; 31]).is_err());
+    assert!(super::quant::quantize_to_q5_1(&[0.0f32; 33]).is_err());
+}
+
+#[test]
+fn test_quantized_tensor_row_access_for_affine_types() {
+    // Two rows of 32 elements each; row 1 must start exactly one block in.
+    let data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.5 - 8.0).collect();
+    for qt in [QuantType::Q4_1, QuantType::Q5_1] {
+        let t = quantize_tensor(&data, &[32, 2], qt).expect("quantize");
+        assert_eq!(t.row_byte_offset(0), 0);
+        assert_eq!(t.row_byte_offset(1), qt.block_bytes());
+        assert_eq!(t.row_bytes(1).len(), qt.block_bytes());
     }
 }

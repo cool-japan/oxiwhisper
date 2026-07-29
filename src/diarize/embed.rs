@@ -281,7 +281,9 @@ impl EcapaOnnx {
 
         // Real log-mel filterbank: [n_mels, num_frames], row-major.
         let mel_filters = crate::mel_filters::generate_mel_filters();
-        let mel = crate::mel::log_mel_spectrogram(&resampled, &mel_filters);
+        // Unpadded: a speaker-embedding window is a few seconds long, and the
+        // ECAPA graph consumes whatever frame count it is given.
+        let mel = crate::mel::log_mel_spectrogram_unpadded(&resampled, &mel_filters)?;
         let n_mels = Self::N_MELS;
 
         // Transpose [n_mels, num_frames] -> [num_frames, n_mels] so the tensor

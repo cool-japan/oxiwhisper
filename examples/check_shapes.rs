@@ -192,10 +192,11 @@ fn check_mel_shapes(r: &mut Results) {
         .map(|i| ((i % 7) as f32 + 1.0) * 0.001)
         .collect();
 
-    let mel_data = mel::log_mel_spectrogram(&audio, &mel_filters);
+    let mel_data = mel::log_mel_spectrogram_unpadded(&audio, &mel_filters)
+        .expect("mel filter bank must be well formed");
 
     // Expected number of frames for 1 second of audio
-    let expected_n_frames = (n_samples.div_ceil(hop) + 1).min(sample_rate * 30 / hop);
+    let expected_n_frames = (n_samples / hop).clamp(1, sample_rate * 30 / hop);
     let expected_len = n_mels * expected_n_frames;
     r.check_len(
         &format!("mel spectrogram total len ({n_mels} x {expected_n_frames})"),
@@ -227,8 +228,9 @@ fn check_mel_shapes(r: &mut Results) {
         })
         .collect();
 
-    let mel_data_3s = mel::log_mel_spectrogram(&audio_3s, &mel_filters);
-    let expected_frames_3s = (n_samples_3s.div_ceil(hop) + 1).min(sample_rate * 30 / hop);
+    let mel_data_3s = mel::log_mel_spectrogram_unpadded(&audio_3s, &mel_filters)
+        .expect("mel filter bank must be well formed");
+    let expected_frames_3s = (n_samples_3s / hop).clamp(1, sample_rate * 30 / hop);
     let expected_len_3s = n_mels * expected_frames_3s;
     r.check_len(
         &format!("mel spectrogram 3s total len ({n_mels} x {expected_frames_3s})"),
@@ -238,7 +240,8 @@ fn check_mel_shapes(r: &mut Results) {
 
     // Test with very short audio (less than one window)
     let short_audio: Vec<f32> = vec![0.1; 100];
-    let mel_short = mel::log_mel_spectrogram(&short_audio, &mel_filters);
+    let mel_short = mel::log_mel_spectrogram_unpadded(&short_audio, &mel_filters)
+        .expect("mel filter bank must be well formed");
     let short_frames = mel_short.len() / n_mels;
     // Even very short audio should produce at least 1 frame
     let short_pass = short_frames >= 1 && mel_short.len() == n_mels * short_frames;

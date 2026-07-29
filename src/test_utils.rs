@@ -26,11 +26,16 @@
 //! `apply_timestamp_rules` masking (see [`crate::decode_utils`]).
 //!
 //! With timestamps enabled the emitted sequence (excluding the prompt) is:
-//! `<|0.00|> <|0.00|> hello <|1.00|> <|1.00|> world <|2.00|> <|2.00|>` then
-//! `<|endoftext|>`, which [`crate::tokenizer::parse_segments`] turns into two
-//! segments `(0.00–1.00, "hello")` and `(1.00–2.00, "world")`. The doubled
-//! timestamps are forced by this crate's pair rule (a lone timestamp must be
-//! followed by another timestamp before any text).
+//! `<|0.00|> hello <|1.00|> <|1.00|> world <|2.00|> <|endoftext|>`, which
+//! [`crate::tokenizer::parse_segments`] turns into two segments
+//! `(0.00–1.00, "hello")` and `(1.00–2.00, "world")`.
+//!
+//! That shape is dictated by OpenAI's `ApplyTimestampRules` (see
+//! `crate::decode_utils::apply_timestamp_rules`): the first sampled token must
+//! be a timestamp; a timestamp whose predecessor is a timestamp *or is absent*
+//! must be followed by text; and a timestamp preceded by text closes a segment,
+//! so only another timestamp or `<|endoftext|>` may follow — hence the doubled
+//! `<|1.00|>` **between** segments and the single `<|0.00|>` at the start.
 //!
 //! See `design_override` and `DESIGN_TOKENS` for the concrete weights.
 
@@ -607,21 +612,19 @@ const DESIGN_TOKENS: [(u32, usize); 6] = [
 /// Designed `(decoder position, steering dimension)` pairs.
 ///
 /// Position `p` steers the token generated *from* that position onto the token
-/// owning that dimension. Positions 2–10 cover the greedy walk for a
+/// owning that dimension. Positions 2–8 cover the greedy walk for a
 /// timestamps-enabled prompt (`[sot, lang, transcribe]`, length 3, so the first
 /// generated token is driven by `positional_embedding[2]`). A timestamps-
 /// disabled prompt is one token longer, which simply shifts the same table by
 /// one and yields `hello world` after timestamp stripping.
-const DESIGN_POSITIONS: [(usize, usize); 9] = [
-    (2, 0),  // <|0.00|>
-    (3, 0),  // <|0.00|>  (pair-closing timestamp forced by the lone-timestamp rule)
-    (4, 1),  // hello
-    (5, 2),  // <|1.00|>
-    (6, 2),  // <|1.00|>
-    (7, 3),  // world
-    (8, 4),  // <|2.00|>
-    (9, 4),  // <|2.00|>
-    (10, 5), // <|endoftext|>
+const DESIGN_POSITIONS: [(usize, usize); 7] = [
+    (2, 0), // <|0.00|>  (initial position: a timestamp is forced)
+    (3, 1), // hello     (forced to be text — the opening timestamp has no predecessor)
+    (4, 2), // <|1.00|>  (closes the first segment)
+    (5, 2), // <|1.00|>  (pair-closing timestamp forced by the lone-timestamp rule)
+    (6, 3), // world
+    (7, 4), // <|2.00|>  (closes the second segment)
+    (8, 5), // <|endoftext|> (legal after a lone timestamp — EOT is never masked)
 ];
 
 /// Return the designed embedding dimension for a token id, if it is a designed token.

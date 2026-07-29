@@ -1,10 +1,12 @@
-//! Dequantization: Q4_0, Q5_0, Q8_0 block and full-tensor dequantization.
+//! Dequantization: Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 block and full-tensor
+//! dequantization.
 
 use half::f16;
 
 use super::types::{
-    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES,
-    Q8_0_BLOCK_SIZE,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_SIZE, Q4_1_BLOCK_BYTES, Q4_1_BLOCK_SIZE, Q5_0_BLOCK_BYTES,
+    Q5_0_BLOCK_SIZE, Q5_1_BLOCK_BYTES, Q5_1_BLOCK_SIZE, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_SIZE,
+    QuantType,
 };
 
 /// Dequantize a single Q4_0 block (18 bytes) into 32 f32 values.
@@ -24,6 +26,28 @@ pub fn dequantize_q4_0_block(block: &[u8], output: &mut [f32]) {
         let hi = ((byte >> 4) & 0x0F) as i32 - 8;
         output[i] = lo as f32 * scale;
         output[i + 16] = hi as f32 * scale;
+    }
+}
+
+/// Dequantize a single Q4_1 block (20 bytes) into 32 f32 values.
+///
+/// Format: `[f16 scale d][f16 min m][16 bytes of nibbles]`.
+/// Each byte holds two unsigned 4-bit integers; low nibbles map to elements
+/// `0..16` and high nibbles to elements `16..32`:
+/// `float_val = nibble * d + m` (affine, *not* offset by 8 like Q4_0).
+pub fn dequantize_q4_1_block(block: &[u8], output: &mut [f32]) {
+    debug_assert!(block.len() >= Q4_1_BLOCK_BYTES);
+    debug_assert!(output.len() >= Q4_1_BLOCK_SIZE);
+
+    let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+
+    for i in 0..16 {
+        let byte = block[4 + i];
+        let lo = (byte & 0x0F) as f32;
+        let hi = ((byte >> 4) & 0x0F) as f32;
+        output[i] = lo * scale + min;
+        output[i + 16] = hi * scale + min;
     }
 }
 
@@ -50,6 +74,32 @@ pub fn dequantize_q5_0_block(block: &[u8], output: &mut [f32]) {
 
         output[i] = ((lo_nibble | (hi_bit_lo << 4)) - 16) as f32 * scale;
         output[i + 16] = ((hi_nibble | (hi_bit_hi << 4)) - 16) as f32 * scale;
+    }
+}
+
+/// Dequantize a single Q5_1 block (24 bytes) into 32 f32 values.
+///
+/// Format: `[f16 scale d][f16 min m][u32 high-bit mask qh][16 bytes of nibbles]`.
+/// Each value is an unsigned 5-bit integer (0..=31):
+/// `float_val = (low_nibble | (high_bit << 4)) * d + m`.
+pub fn dequantize_q5_1_block(block: &[u8], output: &mut [f32]) {
+    debug_assert!(block.len() >= Q5_1_BLOCK_BYTES);
+    debug_assert!(output.len() >= Q5_1_BLOCK_SIZE);
+
+    let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+
+    for i in 0..16 {
+        let byte = block[8 + i];
+        let lo_nibble = (byte & 0x0F) as u32;
+        let hi_nibble = ((byte >> 4) & 0x0F) as u32;
+
+        let hi_bit_lo = (qh >> i) & 1;
+        let hi_bit_hi = (qh >> (i + 16)) & 1;
+
+        output[i] = (lo_nibble | (hi_bit_lo << 4)) as f32 * scale + min;
+        output[i + 16] = (hi_nibble | (hi_bit_hi << 4)) as f32 * scale + min;
     }
 }
 
@@ -82,6 +132,34 @@ pub fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     output
 }
 
+/// Dequantize an entire Q4_1 tensor into f32.
+pub fn dequantize_q4_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / Q4_1_BLOCK_SIZE;
+    let mut output = vec![0.0f32; n_elements];
+    let mut block_buf = [0.0f32; Q4_1_BLOCK_SIZE];
+
+    for b in 0..n_blocks {
+        let block_start = b * Q4_1_BLOCK_BYTES;
+        dequantize_q4_1_block(&data[block_start..], &mut block_buf);
+        output[b * Q4_1_BLOCK_SIZE..(b + 1) * Q4_1_BLOCK_SIZE].copy_from_slice(&block_buf);
+    }
+    output
+}
+
+/// Dequantize an entire Q5_1 tensor into f32.
+pub fn dequantize_q5_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / Q5_1_BLOCK_SIZE;
+    let mut output = vec![0.0f32; n_elements];
+    let mut block_buf = [0.0f32; Q5_1_BLOCK_SIZE];
+
+    for b in 0..n_blocks {
+        let block_start = b * Q5_1_BLOCK_BYTES;
+        dequantize_q5_1_block(&data[block_start..], &mut block_buf);
+        output[b * Q5_1_BLOCK_SIZE..(b + 1) * Q5_1_BLOCK_SIZE].copy_from_slice(&block_buf);
+    }
+    output
+}
+
 /// Dequantize an entire Q5_0 tensor into f32.
 pub fn dequantize_q5_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     let n_blocks = n_elements / Q5_0_BLOCK_SIZE;
@@ -108,4 +186,15 @@ pub fn dequantize_q8_0(data: &[u8], n_elements: usize) -> Vec<f32> {
         output[b * Q8_0_BLOCK_SIZE..(b + 1) * Q8_0_BLOCK_SIZE].copy_from_slice(&block_buf);
     }
     output
+}
+
+/// Dequantize an entire tensor of any supported [`QuantType`] into f32.
+pub fn dequantize(data: &[u8], n_elements: usize, qtype: QuantType) -> Vec<f32> {
+    match qtype {
+        QuantType::Q4_0 => dequantize_q4_0(data, n_elements),
+        QuantType::Q4_1 => dequantize_q4_1(data, n_elements),
+        QuantType::Q5_0 => dequantize_q5_0(data, n_elements),
+        QuantType::Q5_1 => dequantize_q5_1(data, n_elements),
+        QuantType::Q8_0 => dequantize_q8_0(data, n_elements),
+    }
 }

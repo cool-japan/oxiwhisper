@@ -1,6 +1,6 @@
 //! SIMD dispatch shims: select the fastest available dot product at runtime.
 
-use super::dot_scalar::{dot_q4_0, dot_q5_0, dot_q8_0};
+use super::dot_scalar::{dot_q4_0, dot_q4_1, dot_q5_0, dot_q5_1, dot_q8_0};
 
 #[cfg(target_arch = "x86_64")]
 use super::dot_simd_x86::{dot_q4_0_avx2, dot_q5_0_avx2, dot_q8_0_avx2};
@@ -27,6 +27,24 @@ pub fn dot_q4_0_fast(input: &[f32], quantized: &[u8], n: usize) -> f32 {
     }
     #[allow(unreachable_code)]
     dot_q4_0(input, quantized, n)
+}
+
+/// Q4_1 dot product.
+///
+/// No SIMD kernel exists for the affine 4-bit layout yet, so this is a thin
+/// alias for the scalar [`dot_q4_1`]. It is kept as a `_fast` entry point so
+/// callers dispatch uniformly across quantization types.
+pub fn dot_q4_1_fast(input: &[f32], quantized: &[u8], n: usize) -> f32 {
+    dot_q4_1(input, quantized, n)
+}
+
+/// Q5_1 dot product.
+///
+/// No SIMD kernel exists for the affine 5-bit layout yet, so this is a thin
+/// alias for the scalar [`dot_q5_1`]. It is kept as a `_fast` entry point so
+/// callers dispatch uniformly across quantization types.
+pub fn dot_q5_1_fast(input: &[f32], quantized: &[u8], n: usize) -> f32 {
+    dot_q5_1(input, quantized, n)
 }
 
 /// SIMD-accelerated Q5_0 dot product when available, falling back to scalar.

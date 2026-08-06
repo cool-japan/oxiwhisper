@@ -32,7 +32,7 @@ diarization = []
 half = "2.7"
 matrixmultiply = "0.3"
 memmap2 = "0.9"
-oxifft = "0.4.1"
+oxifft = "0.4.2"
 rayon = { version = "1.12", optional = true }
 # NOTE: oxionnx 0.1.2 transitively pins oxifft ^0.2.0 via oxionnx-ops.
 # This causes a duplicate oxifft entry in Cargo.lock when `onnx` feature
